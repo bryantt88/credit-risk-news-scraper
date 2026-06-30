@@ -1,0 +1,414 @@
+{
+  "sectors": [
+    {
+      "sector_name": "Aerospace And Defense",
+      "business_risk_keywords": [
+        "Shifts in strategic alignment or overall market share within the defense and commercial aerospace sectors. The company experiences fluctuations in demand, cyclical commercial downturns, or defense budget cuts that directly impact revenue stability.",
+        "Supply chain bottlenecks, program execution delays, or severe cost overruns disrupt original equipment manufacturer (OEM) technological rollouts. The firm faces heightened substitution risk due to an inability to introduce next-generation platforms on schedule."
+      ],
+      "financial_risk_keywords": [
+        "Lumpy working capital flows are triggered by massive advance payments or heavy R&D capital expenditure cycles. The company experiences extreme fluctuations in free operating cash flow (FOCF) to debt stemming from volatile long-term service agreement profitability."
+      ]
+    },
+    {
+      "sector_name": "Agribusiness, Commodity Foods, And Agricultural Cooperatives",
+      "business_risk_keywords": [
+        "Volatile crop cycles, catastrophic disease outbreaks, or shifting global harvest yields alter processing margins and commodity sourcing costs. The company suffers from regulatory tariff impositions or unpredictable basis management that degrades its logistical cost position.",
+        "Value-added product lines experience intense substitution risk from commoditized competitors. Sudden shifts in end-market demand force severe rationalization of production capacity and storage infrastructure."
+      ],
+      "financial_risk_keywords": [
+        "Significant intrayear working capital swings exacerbate seasonal borrowing requirements and constrain liquidity reserves. Heavy mark-to-market margin calls on derivative hedges severely impact FFO-to-debt metrics and short-term capital flexibility."
+      ]
+    },
+    {
+      "sector_name": "Auto And Commercial Vehicle Manufacturing",
+      "business_risk_keywords": [
+        "Disruptive technological shifts toward electrification and autonomous driving render legacy powertrain manufacturing capacity obsolete. The manufacturer suffers from supply chain bottlenecks and raw material inflation that degrade capacity utilization and fixed-cost absorption.",
+        "Deteriorating consumer sentiment and pricing competition force deep promotional discounting, eroding brand equity. Geopolitical fragmentation and regional trade tariffs severely disrupt global distribution networks and sourcing channels."
+      ],
+      "financial_risk_keywords": [
+        "Earnings deconsolidation from captive finance subsidiaries distorts primary EBITDA margins and disguises underlying leverage risks. Accelerated R&D and capital expenditure burn rates depress free operating cash flow conversion during cyclical downswings."
+      ]
+    },
+    {
+      "sector_name": "Auto Suppliers",
+      "business_risk_keywords": [
+        "Original equipment manufacturer (OEM) pricing pressures and insourcing initiatives chronically compress supplier contribution margins. The rapid transition to electric vehicles displaces high-margin internal combustion engine product volumes, necessitating aggressive technological reinvestment.",
+        "Overreliance on a critical subcomponent supplier increases exposure to supply-chain paralysis. The supplier faces abrupt volume fluctuations and cancellation of highly profitable aftermarket contracts during an economic downturn."
+      ],
+      "financial_risk_keywords": [
+        "Massive fixed launch costs and working capital drains accelerate during the ramp-up of newly awarded platform contracts. Erratic OEM production schedules drive heightened free operating cash flow (FOCF) volatility and stress liquidity buffers."
+      ]
+    },
+    {
+      "sector_name": "Building Materials",
+      "business_risk_keywords": [
+        "Cyclical contractions in residential or commercial construction end-markets suppress core material volume demand. Severe input cost inflation outpaces the firm's price realization capabilities, leading to massive gross margin compression across commoditized product lines.",
+        "Loss of exclusive distribution arrangements undermines purchasing power and exposes the company to heightened pricing wars. Structural overcapacity and outdated production technologies severely inflate per-unit manufacturing costs."
+      ],
+      "financial_risk_keywords": [
+        "Curtailed capital expenditures and deferred maintenance programs drag on the long-term viability of asset-intensive cash flow profiles. Countercyclical working capital liquidations mask underlying revenue deterioration but temporarily support CFO-to-debt metrics."
+      ]
+    },
+    {
+      "sector_name": "Business And Consumer Services",
+      "business_risk_keywords": [
+        "Heightened client attrition and contract non-renewals stem from deteriorating service quality or disruptive market entrants. Intense labor wage inflation and inflexible workforce structures constrain the firm's ability to preserve EBITDA margins during demand slumps.",
+        "Failure to successfully harness brand equity prevents expansion into new service categories. Heavy reliance on a single demographic or geographic end-market exposes the business to acute localized economic shocks."
+      ],
+      "financial_risk_keywords": [
+        "Substantial intrayear working capital volatility is triggered by government agency payment delays or generalized accounts receivable elongation. Aggressive debt-funded leveraged buyouts or high dividend recapitalizations systematically erode discretionary cash flow."
+      ]
+    },
+    {
+      "sector_name": "Capital Goods",
+      "business_risk_keywords": [
+        "Macroeconomic deceleration stalls early, mid, or late-cycle industrial equipment procurement and rapidly erodes order backlogs. Subpar project execution and raw material cost escalations severely degrade fixed-price contract profitability.",
+        "Lack of proprietary aftermarket parts or servicing contracts exposes the firm to intense commoditized competition and elevated customer churn. An inability to adapt to shifting technological standards renders existing equipment leasing fleets obsolete."
+      ],
+      "financial_risk_keywords": [
+        "Countercyclical inventory liquidation temporarily inflates FOCF-to-debt ratios during early-stage downturns. Resurgent working capital funding needs and aggressive rental fleet rejuvenation capex critically depress free cash flow during economic upswings."
+      ]
+    },
+    {
+      "sector_name": "Commodity Chemicals",
+      "business_risk_keywords": [
+        "Global supply-demand imbalances and rampant capacity gluts collapse petrochemical processing margins. Extreme volatility in raw material and energy feedstocks severely impairs unhedged cost positions and plummets capacity utilization rates.",
+        "Concentrated exposure to a single raw material disrupts continuous production when localized supply chains fail. A lack of vertical integration forces the company to absorb supplier margin stacks, destroying its position on the global cost curve."
+      ],
+      "financial_risk_keywords": [
+        "Lumpy capital expenditure requirements for major facility capacity expansions stress long-term FOCF-to-debt metrics. Rapid inventory valuation swings drive unpredictable working capital outflows, sharply impacting near-term EBITDA-to-interest coverage."
+      ]
+    },
+    {
+      "sector_name": "Consumer Durables",
+      "business_risk_keywords": [
+        "Declining discretionary consumer spending and heightened promotional discounting structurally erode brand equity and pricing power. Disruptions in global manufacturing supply chains or major retailer bankruptcies lead to massive inventory liquidations.",
+        "Failure to innovate or integrate sustainable manufacturing practices alienates key demographics and shrinks market share. Intense reliance on outsourced manufacturing exposes the firm to sudden geopolitical tariff shocks and freight rate escalations."
+      ],
+      "financial_risk_keywords": [
+        "Pronounced seasonal working capital build-ups necessitate heavy intrayear borrowing and strain FFO-to-cash interest coverage. Elevated capital expenditures aimed at facility modernization and automation temporarily suppress FOCF generation."
+      ]
+    },
+    {
+      "sector_name": "Consumer Staples And Branded Nondurables",
+      "business_risk_keywords": [
+        "Aggressive private-label penetration and shifting consumer preferences continuously erode premier brand market share and pricing leverage. Extreme agricultural or energy commodity inflation crushes gross margins amidst constrained pass-through capabilities.",
+        "Concentrated reliance on a handful of big-box retail distributors severely compromises negotiating leverage and shelf-space visibility. Failure to modernize omnichannel distribution networks isolates the firm from rapid e-commerce growth."
+      ],
+      "financial_risk_keywords": [
+        "Strategic acquisitions or aggressive shareholder return policies systematically stress discretionary cash flow profiles. Highly efficient working capital management and rapid asset turnover structurally insulate FOCF-to-debt during cyclical retail downturns."
+      ]
+    },
+    {
+      "sector_name": "Containers And Packaging",
+      "business_risk_keywords": [
+        "Sustained raw material inflation in plastic resins or aluminum outpaces contractual pass-through mechanisms, severely compressing operating margins. Shifts in consumer preferences or regulatory mandates accelerate substitution risk toward alternative packaging substrates.",
+        "Overcapacity in commoditized flexible packaging segments triggers ferocious price wars that negate economies of scale. High customer concentration forces the firm into margin-crushing pricing concessions during multiyear contract renewals."
+      ],
+      "financial_risk_keywords": [
+        "Large-scale capacity expansions or debt-funded industry consolidation aggressively stress core leverage metrics. Robust countercyclical working capital releases artificially bolster FOCF-to-debt figures during macroeconomic contractions."
+      ]
+    },
+    {
+      "sector_name": "Contract Drilling",
+      "business_risk_keywords": [
+        "Precipitous declines in upstream exploration and production (E&P) capital expenditure trigger severe day-rate compression and rampant rig idling. Idiosyncratic catastrophic operational failures or safety breaches result in immediate, long-term contract cancellations.",
+        "An aging, low-specification rig fleet loses market relevance as clients transition to ultra-deepwater and harsh-environment drilling campaigns. Geopolitical instability in key operating basins strands capital-intensive assets and halts regional deployments."
+      ],
+      "financial_risk_keywords": [
+        "Aggressive speculative newbuild programs executed without pre-signed contracts severely strain liquidity and leverage capacity. Substantial countercyclical fleet maintenance deferrals temporarily inflate FOCF-to-debt metrics while degrading long-term asset viability."
+      ]
+    },
+    {
+      "sector_name": "Digital Infrastructure",
+      "business_risk_keywords": [
+        "Heightened overbuild competition and poor market penetration rates erode fiber wholesale take-up, actively suppressing return on investment. Tenant churn and contract non-renewals are triggered by latency issues or uncompetitive power usage effectiveness (PUE) at legacy data centers.",
+        "Incumbent telecommunications providers spin off vast tower portfolios, instantly destabilizing market consolidation and introducing ferocious new entrants. Disruptive technologies such as low Earth orbit satellite broadband threaten to cannibalize remote fiber and tower footprints."
+      ],
+      "financial_risk_keywords": [
+        "Massive speculative greenfield development pipelines require extended cash flow lags and severely elevate execution and lease-up risks. High levels of debt-funded real estate acquisition structurally stress debt-to-capital and FFO-to-debt coverage ratios."
+      ]
+    },
+    {
+      "sector_name": "Engineering And Construction",
+      "business_risk_keywords": [
+        "Severe cost overruns, unapproved change orders, or catastrophic subcontractor failures destroy profit margins on complex, first-of-a-kind fixed-price contracts. Depleted contract backlogs stem from macroeconomic slowdowns and heightened competitive bidding indiscipline.",
+        "Reputational damage from fatal safety incidents or massive project delays completely disqualifies the firm from subsequent government infrastructure tenders. Geopolitical disruptions in key emerging markets force sudden project abandonments and massive asset write-downs."
+      ],
+      "financial_risk_keywords": [
+        "Volatile intrayear working capital swings are exacerbated by advanced payment burn-offs and delayed accounts receivable collections during downcycles. Significant liquidity constraints are triggered by massive letter of credit (LOC) or surety bond posting requirements required to secure new bids."
+      ]
+    },
+    {
+      "sector_name": "Environmental Services",
+      "business_risk_keywords": [
+        "Depressed commercial waste volumes and weak municipal contract pricing renewals constrict route density and obliterate operational leverage. Escalating diesel fuel costs and third-party disposal fees continuously outstrip the firm's contractual pass-through allowances.",
+        "Failure to secure critical zoning permits for new landfill capacity strands capital and severely limits long-term regional market share. Intense competition from vertically integrated mega-players drives severe pricing compression in commoditized recycling segments."
+      ],
+      "financial_risk_keywords": [
+        "Elevated capital expenditures necessary to maintain landfill capacity and transition route vehicle fleets to alternative fuels temporarily depress FOCF-to-debt. Stable, franchise-protected cash flows structurally insulate long-term FFO-to-debt profiles from severe macroeconomic shocks."
+      ]
+    },
+    {
+      "sector_name": "Forest And Paper Products",
+      "business_risk_keywords": [
+        "Structural digitization trends accelerate the permanent secular decline of graphic paper demand, violently depressing mill capacity utilization rates. Surging regional wood fiber and energy costs severely impair the cost-competitiveness of non-integrated, standalone producers.",
+        "Overreliance on a single geographic timber supply exposes the firm to catastrophic raw material shortages caused by wildfires or stringent environmental logging bans. Intensely competitive global export markets trigger brutal price wars that crush unhedged commodity product margins."
+      ],
+      "financial_risk_keywords": [
+        "Extreme commodity price cyclicality drives profound peak-to-trough cash flow volatility, repeatedly stressing EBITDA-to-interest coverage. Capital-intensive machine conversions and facility retrofits precipitate massive, multi-year free operating cash flow (FOCF) deficits."
+      ]
+    },
+    {
+      "sector_name": "Health Care Equipment",
+      "business_risk_keywords": [
+        "Stringent regulatory sanctions, debilitating product recalls, or delayed clinical trial approvals devastate brand reputation and permanently cede market share. Aggressive hospital group purchasing organizations and generic substitutions drive severe downward pricing pressure on legacy commoditized supplies.",
+        "Rapid technological obsolescence renders primary surgical implant portfolios uncompetitive against next-generation robotic or minimally invasive alternatives. Disruptions in highly specialized contract manufacturing supply chains halt critical product distributions."
+      ],
+      "financial_risk_keywords": [
+        "Transformational debt-funded acquisitions targeting high-tech product pipelines severely elevate baseline leverage and integration risks. Sustained high R&D outlays and requisite capacity expansions constantly drag on discretionary cash flow generation."
+      ]
+    },
+    {
+      "sector_name": "Health Care Services",
+      "business_risk_keywords": [
+        "Drastic cuts to government reimbursement rates or adverse shifts toward uninsured payor mixes severely compress facility operating margins. Subpar clinical quality metrics or chronic professional staffing shortages trigger lost contracts and diminished patient volumes.",
+        "A hyper-fragmented local market structure with low barriers to entry unleashes fierce price competition from rival outpatient clinics and not-for-profit hospitals. Onerous shifts in national health care regulations impose massive unfunded compliance costs on the provider."
+      ],
+      "financial_risk_keywords": [
+        "Aggressive debt-funded geographic roll-ups and heavy lease obligations structurally impair EBITDAR-to-interest coverage. Significant uncompensated care provisions and erratic bad debt expenses severely disrupt cash flow predictability and working capital optimization."
+      ]
+    },
+    {
+      "sector_name": "Homebuilders And Real Estate Developers",
+      "business_risk_keywords": [
+        "Surging mortgage interest rates and declining demographic demand plunge the residential housing cycle into a severe contractionary phase. Aggressive speculative land banking and uncontrolled construction material cost inflation decimate return on capital and inventory turnover.",
+        "Protracted delays in local permitting and entitlement processes strand development capital and ruin projected project yields. Overconcentration in luxury or secondary-home segments leaves the developer acutely vulnerable to discretionary wealth shocks."
+      ],
+      "financial_risk_keywords": [
+        "Profound cyclical impairments mandate massive land inventory write-downs and trigger severe debt covenant breaches. Extensive use of percentage-of-completion accounting masks underlying cash flow deficits and artificially inflates near-term leverage metrics."
+      ]
+    },
+    {
+      "sector_name": "Leisure And Sports",
+      "business_risk_keywords": [
+        "Severe discretionary consumer spending pullbacks or unprecedented global travel shocks devastate theme park attendance and cruise line net revenue yields. Intense market overcapacity and ferocious promotional discounting ravage local gaming and fitness club profit margins.",
+        "A lack of consistent asset reinvestment degrades the visitor experience, resulting in plummeting customer loyalty and lost market share to premier destination resorts. Unpredictable shifts in media rights demand severely undercut the long-term sponsorship revenues of major sports franchises."
+      ],
+      "financial_risk_keywords": [
+        "Capital-intensive cruise ship deliveries or mega-resort developments generate massive multi-year free operating cash flow (FOCF) deficits. Extremely high fixed-cost leverage results in rapid EBITDA-to-interest coverage deterioration during sudden cyclical demand shocks."
+      ]
+    },
+    {
+      "sector_name": "Media And Entertainment",
+      "business_risk_keywords": [
+        "Secular shifts toward digital streaming and ad-supported online platforms aggressively cannibalize legacy linear television and print publishing revenues. Disastrous theatrical slate performances or the loss of premier sports broadcasting rights crater audience ratings and advertising yields.",
+        "A chronic inability to monetize mobile traffic and proprietary data effectively surrenders digital market share to dominant search engine and social media monopolies. Rampant piracy and intellectual property theft severely degrade the monetization windows for global content distribution."
+      ],
+      "financial_risk_keywords": [
+        "Aggressive debt-funded content acquisitions and abrupt programming write-offs severely distort baseline EBITDA-to-interest run rates. Working capital mismatches between upfront production costs and delayed syndication revenues perennially strain FOCF profiles."
+      ]
+    },
+    {
+      "sector_name": "Metals Production And Processing",
+      "business_risk_keywords": [
+        "Massive influxes of low-cost international imports and collapsing global benchmark prices obliterate domestic smelting and processing margins. Surging raw material and electricity costs severely strand unhedged operations in the highest quartile of the global cost curve.",
+        "Loss of long-term off-take contracts forces the producer into highly volatile spot markets with unpredictable volume absorption. Failure to transition to low-carbon technologies incites severe regulatory penalties and alienates environmentally conscious end-markets."
+      ],
+      "financial_risk_keywords": [
+        "Brutal commodity downcycles decimate EBITDA generation, triggering severe liquidity crises and eroding debt repayment capacity. Aggressive countercyclical capital expenditures and massive inventory build-ups catastrophically exacerbate FOCF-to-debt deterioration."
+      ]
+    },
+    {
+      "sector_name": "Midstream Energy",
+      "business_risk_keywords": [
+        "Plummeting basin production volumes or major upstream counterparty bankruptcies leave gathering systems and long-haul pipelines fundamentally stranded. Severe commodity price contractions compress unhedged processing margins and violently depress volumetric throughput fees.",
+        "Intense regulatory opposition and environmental litigation indefinitely stall critical pipeline expansions, destroying projected growth trajectories. A lack of integration forces the company to rely exclusively on highly volatile, short-term spot transit agreements."
+      ],
+      "financial_risk_keywords": [
+        "Massive debt-funded pipeline construction projects suffer from severe cost overruns and protracted cash flow lags prior to commissioning. Distributions to unitholders continually outpace internally generated cash flow, forcing persistent and dangerous reliance on external capital markets."
+      ]
+    },
+    {
+      "sector_name": "Mining",
+      "business_risk_keywords": [
+        "Depleted ore grades, escalating extraction complexities, and chronic labor strikes destroy unit cash costs and push assets dangerously up the global merit curve. Aggressive geopolitical interventions, including expropriations or punitive taxation, render jurisdictional operations economically unviable.",
+        "A catastrophic failure in a single mega-mine completely halts corporate production, exposing a severe lack of asset and geographic diversification. Extreme environmental liabilities from tailings dam failures obliterate the firm's social license to operate."
+      ],
+      "financial_risk_keywords": [
+        "Massive greenfield mine developments require multi-billion-dollar upfront investments, causing prolonged and dangerous FOCF deficits. Intense cyclical commodity price collapses trigger rapid leverage spikes and potential debt covenant violations."
+      ]
+    },
+    {
+      "sector_name": "Oil And Gas Exploration And Production",
+      "business_risk_keywords": [
+        "A chronic inability to replace depleting reserves economically results in plunging reserve life indices and steep production drop-offs. Crashing global hydrocarbon prices and widening regional basis differentials destroy wellhead netbacks and render vast acreage positions unprofitable.",
+        "Catastrophic offshore drilling failures provoke massive environmental liabilities and immediate revocations of operating licenses. High concentration in mature, high-cost basins leaves the producer entirely uncompetitive against prolific shale operators."
+      ],
+      "financial_risk_keywords": [
+        "Insufficient operating cash flow forces drastic cuts to maintenance capital expenditure, imperiling future production stability. Transformational, debt-funded acreage acquisitions mask persistently poor organic finding and development (F&D) cost efficiencies and inflate leverage."
+      ]
+    },
+    {
+      "sector_name": "Oilfield Services And Equipment",
+      "business_risk_keywords": [
+        "Drastic upstream capital expenditure cuts trigger collapsing utilization rates and ferocious day-rate pricing concessions across the service fleet. Rapid technological obsolescence or catastrophic equipment failures destroy vendor reputation and lead to immediate, uncompensated contract terminations.",
+        "Overreliance on a single mega-cap integrated oil customer exposes the service provider to severe revenue shocks when that client abruptly changes strategic focus. Chronic supply chain bottlenecks paralyze the timely delivery of mission-critical drilling equipment, forfeiting market share to rivals."
+      ],
+      "financial_risk_keywords": [
+        "Substantial working capital consumption during industry upswings aggressively cannibalizes FOCF and necessitates heavy revolving credit facility reliance. Severe cash burn during protracted downcycles dangerously tests minimum liquidity thresholds and EBITDA-to-interest covenants."
+      ]
+    },
+    {
+      "sector_name": "Pharmaceuticals",
+      "business_risk_keywords": [
+        "Massive patent cliffs and aggressive generic market entry obliterate blockbuster drug revenues and decimate global market share. Late-stage clinical trial failures or stringent regulatory sanctions devastate the commercial viability of the R&D pipeline and strand sunk costs.",
+        "Fierce negotiating pressure from consolidated pharmacy benefit managers and government payors forces severe pricing concessions on vital therapies. Chronic manufacturing non-compliance at key facilities halts product distribution and incites massive FDA remediation penalties."
+      ],
+      "financial_risk_keywords": [
+        "Transformational debt-funded acquisitions of rival pipelines or biotech firms structurally elevate baseline financial leverage and integration risks. High, inflexible R&D and marketing expenditures severely limit FOCF elasticity during periods of acute revenue compression."
+      ]
+    },
+    {
+      "sector_name": "Railroad, Package Express, And Logistics",
+      "business_risk_keywords": [
+        "Macroeconomic industrial recessions cause steep declines in bulk carload volumes and intermodal freight traffic, devastating network utilization. Intense price wars, severe labor union disruptions, or surging unhedged diesel fuel costs rapidly deteriorate operating ratios and network efficiency.",
+        "Failure to modernize routing technology and tracking infrastructure cedes lucrative logistics contracts to digitally native, asset-light competitors. A concentrated reliance on a single retail giant exposes the package express carrier to catastrophic volume drops if the client shifts to in-house delivery."
+      ],
+      "financial_risk_keywords": [
+        "Immense maintenance and regulatory capital expenditure requirements perpetually burden free cash flow generation despite strong operating margins. High operating leverage accelerates EBITDA deterioration during volume downcycles, severely straining FFO-to-debt coverage."
+      ]
+    },
+    {
+      "sector_name": "Refining And Marketing",
+      "business_risk_keywords": [
+        "Narrowing heavy-light crude differentials or collapsing global crack spreads destroy the structural profitability of complex coastal refineries. Severe unplanned facility outages or catastrophic environmental hazards trigger massive operational losses and punitive regulatory intervention.",
+        "Lack of proprietary midstream pipeline access forces the refiner to rely on expensive third-party logistics, eroding geographic feedstock advantages. A sudden influx of subsidized refined product imports decimates the competitive positioning of domestic merchant refiners."
+      ],
+      "financial_risk_keywords": [
+        "Extreme peak-to-trough commodity margin volatility dictates aggressive countercyclical leverage spikes that threaten credit stability. Heavy regulatory compliance mandates and mandatory turnaround capital expenditures generate substantial intrayear FOCF deficits."
+      ]
+    },
+    {
+      "sector_name": "Regulated Utilities",
+      "business_risk_keywords": [
+        "Punitive regulatory rate case outcomes or arbitrary political interventions explicitly disallow the recovery of prudently incurred operating and capital costs. Catastrophic extreme weather events or devastating safety failures trigger massive unrecoverable liabilities and reputational destruction.",
+        "A concentrated, deteriorating industrial customer base leads to persistently weak load growth and exacerbates the rate burden on remaining residential customers. Stranded asset risks accelerate as aggressive environmental mandates force the premature retirement of profitable coal-fired generation fleets."
+      ],
+      "financial_risk_keywords": [
+        "Immense multi-year infrastructure modernization and decarbonization programs drive persistent, negative discretionary cash flow. Elevated reliance on short-term debt and volatile seasonal working capital swings severely stress the utility's liquidity profile during commodity price spikes."
+      ]
+    },
+    {
+      "sector_name": "Retail And Restaurants",
+      "business_risk_keywords": [
+        "Fierce e-commerce penetration and shifting consumer preferences render legacy brick-and-mortar merchandising strategies completely obsolete. Severe macroeconomic headwinds and rampant food or labor inflation obliterate same-store sales growth and crush restaurant-level operating margins.",
+        "Disastrous supply chain disruptions and poor inventory planning force massive, margin-destroying promotional liquidations. A failure to innovate digital loyalty programs and omnichannel fulfillment options causes permanent customer defection to tech-savvy competitors."
+      ],
+      "financial_risk_keywords": [
+        "Aggressive debt-funded private equity buyouts or massive dividend recapitalizations structurally impair EBITDAR-to-interest coverage. Intense seasonal working capital dependencies expose the firm to fatal liquidity crunches if peak holiday sales targets are missed."
+      ]
+    },
+    {
+      "sector_name": "Specialty Chemicals",
+      "business_risk_keywords": [
+        "Intense global competition and rapid product commoditization destroy the pricing premiums historically commanded by advanced material formulations. Spiking petrochemical feedstock costs consistently outpace the firm's contractual pass-through capabilities, severely compressing operating margins.",
+        "A failure to invest in cutting-edge R&D leaves the product portfolio vulnerable to substitution by cheaper, generic chemical alternatives. Extreme reliance on a single cyclical end-market, such as automotive or construction, triggers violent demand shocks across the enterprise."
+      ],
+      "financial_risk_keywords": [
+        "Transformational debt-funded M&A targeting niche technological capabilities abruptly elevates baseline leverage metrics. Erratic working capital fluctuations tied to highly volatile raw material inventories cause unpredictable and sharp FOCF-to-debt swings."
+      ]
+    },
+    {
+      "sector_name": "Technology Hardware And Semiconductors",
+      "business_risk_keywords": [
+        "Rapid technological obsolescence and hyper-competitive product cycles relentlessly erode market share for legacy electronic components. Severe global supply chain bottlenecks or plunging semiconductor capacity utilization rates completely decimate structural gross margins.",
+        "Loss of a marquee OEM customer instantaneously voids billions in projected revenue and strands specialized manufacturing capacity. An inability to protect core intellectual property allows low-cost international rivals to flood the market with commoditized clones."
+      ],
+      "financial_risk_keywords": [
+        "Massive, lumpy capital expenditures required for next-generation fabrication plants destroy short-term free cash flow profiles. Brutal cyclical downturns trigger aggressive inventory write-downs and severe EBITDA compression, dangerously testing debt covenants."
+      ]
+    },
+    {
+      "sector_name": "Technology Software And Services",
+      "business_risk_keywords": [
+        "Disruptive cloud-native architectures and software-as-a-service (SaaS) transitions aggressively cannibalize highly profitable legacy perpetual license revenues. High customer churn and intense price competition erode the stickiness and switching costs of mission-critical enterprise applications.",
+        "Catastrophic cybersecurity breaches or prolonged service downtimes irrevocably damage vendor reputation and trigger massive client defections. Failure to continuously innovate R&D pipelines surrenders niche market dominance to agile, well-funded startup competitors."
+      ],
+      "financial_risk_keywords": [
+        "Aggressive debt-funded acquisitions of emerging tech platforms severely inflate leverage and generate massive, potentially impaired goodwill balances. Heavy upfront customer acquisition costs and deferred revenue recognition models temporarily mask underlying cash flow deficits."
+      ]
+    },
+    {
+      "sector_name": "Telecommunications",
+      "business_risk_keywords": [
+        "Ferocious price wars and aggressive promotional handset subsidies drive massive customer churn and collapse average revenue per user (ARPU). Punitive regulatory unbundling mandates or exorbitant spectrum auction costs severely impair the economic return on legacy network infrastructure.",
+        "Failure to upgrade to next-generation fiber or 5G technologies cedes permanent market share to technologically superior alternative carriers. Geopolitical restrictions on critical network equipment vendors force sudden, massively disruptive infrastructure rip-and-replace programs."
+      ],
+      "financial_risk_keywords": [
+        "Monumental capital expenditures for 5G network rollouts and fiber-to-the-home deployments structurally suppress FOCF-to-debt metrics over the medium term. Heavy reliance on debt financing to fund exorbitant spectrum acquisitions or massive dividend payouts critically weakens capital structures."
+      ]
+    },
+    {
+      "sector_name": "Transportation Cyclical",
+      "business_risk_keywords": [
+        "Severe macroeconomic recessions and collapsing global trade volumes decimate shipping freight rates and airline passenger yields. Extreme volatility in bunker fuel or jet aviation fuel costs obliterates unhedged operating profitability and triggers massive operational losses.",
+        "Chronic overcapacity in fragmented bulk shipping markets creates ferocious price competition that prevents the recovery of basic operating costs. Disruptive labor strikes by pilots, dockworkers, or truckers instantly paralyze network logistics and result in catastrophic revenue forfeiture."
+      ],
+      "financial_risk_keywords": [
+        "Capital-intensive fleet modernization programs and debt-funded aircraft or vessel acquisitions cause deep, multi-year FOCF deficits. Extreme cyclical margin compression triggers rapid deterioration of FFO-to-debt ratios and completely exhausts debt covenant headroom."
+      ]
+    },
+    {
+      "sector_name": "Transportation Infrastructure",
+      "business_risk_keywords": [
+        "Arbitrary government interventions or punitive tariff renegotiations destroy the economic viability of long-term concession frameworks. Sustained macroeconomic shocks, global pandemics, or competing alternative networks severely depress passenger volumes and toll road traffic.",
+        "Massive capacity constraints or poor hinterland connectivity permanently cap the growth potential of major seaports and airports. Environmental opposition and stringent noise or emissions regulations indefinitely stall lucrative infrastructure expansion projects."
+      ],
+      "financial_risk_keywords": [
+        "Massive, inflexible capacity expansion requirements heavily back-end remuneration and strain near-term FFO cash interest coverage. Aggressive shareholder distribution policies or impending concession expirations threaten the company's long-term debt repayment capacity and refinancing optionality."
+      ]
+    },
+    {
+      "sector_name": "Unregulated Power And Gas",
+      "business_risk_keywords": [
+        "Collapsing wholesale electricity prices and surging natural gas feedstock costs decimate the spark spreads of merchant thermal generators. Retroactive government alterations to renewable subsidy regimes or severe grid curtailments destroy the economics of green energy portfolios.",
+        "Fierce retail price competition and elevated customer churn rates severely erode the profit margins of pure-play energy supply companies. Catastrophic power plant outages during peak demand periods force the company into punitive spot market purchases to fulfill supply obligations."
+      ],
+      "financial_risk_keywords": [
+        "Extreme peak-to-trough wholesale price volatility triggers massive margin calls on energy trading hedges and rapidly exhausts liquidity buffers. Heavy project finance debt burdens for greenfield renewables severely strain FOCF elasticity during periods of weak wind or solar resource availability."
+      ]
+    },
+    {
+      "sector_name": "Asset Managers",
+      "business_risk_keywords": [
+        "Sustained periods of negative net AUM flows are driven by chronic investment underperformance against benchmarks or peers. Aggressive fee compression stemming from the proliferation of passive investing alternatives permanently undermines the profitability of active management strategies.",
+        "Key man risk materializes as star portfolio managers depart, triggering massive, immediate redemptions from institutional clients. A severe lack of geographic and asset-class diversification leaves the firm highly vulnerable to idiosyncratic market crashes."
+      ],
+      "financial_risk_keywords": [
+        "Severe market downturns obliterate asset values, resulting in the complete evaporation of highly lucrative performance fees and carried interest. Aggressive debt-funded platform acquisitions significantly elevate debt-to-adjusted EBITDA and severely strain the diversity of the firm's capital structure."
+      ]
+    },
+    {
+      "sector_name": "Financial Market Infrastructure",
+      "business_risk_keywords": [
+        "Disastrous technological outages or sophisticated cyber breaches destroy member confidence and trigger mass migrations to competing exchange platforms. Sweeping regulatory overhauls strip away domestic monopoly protections and introduce fierce cross-border clearing competition.",
+        "A failure to list innovative derivative contracts or attract high-profile initial public offerings stagnates trading volume growth. Shrinking market liquidity and severe fragmentation of trading venues structurally depress clearing and transaction revenues."
+      ],
+      "financial_risk_keywords": [
+        "Catastrophic clearing member defaults expose the central counterparty's financial safeguard package and threaten systemic insolvency if guarantee funds are breached. Plunging market volatility and shrinking trading volumes severely contract transaction-based revenue, crushing EBITDA margins."
+      ]
+    },
+    {
+      "sector_name": "Financial Services Finance Companies",
+      "business_risk_keywords": [
+        "Punitive regulatory caps on interest rates or stringent consumer protection laws severely suffocate origination volumes and net interest margins. Disruptive fintech entrants or rapid deterioration in underlying asset quality destroy the competitive positioning of legacy subprime lenders.",
+        "Loss of critical subservicing contracts or severe operational deficiencies in debt collection platforms cause a drastic reduction in fee-based revenues. Extreme macroeconomic stress impairs consumer repayment capabilities, leading to soaring delinquency rates across unsecured loan portfolios."
+      ],
+      "financial_risk_keywords": [
+        "A sudden freezing of short-term warehouse lending facilities or repurchase agreements precipitates an immediate and fatal liquidity crisis. Severe macroeconomic contractions trigger massive credit losses, forcing catastrophic portfolio write-downs and obliterating debt-to-tangible equity cushions."
+      ]
+    }
+  ]
+}

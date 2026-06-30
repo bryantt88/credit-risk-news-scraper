@@ -1,0 +1,6 @@
+requests>=2.31.0
+yfinance>=0.2.40
+spacy>=3.7.0
+sentence-transformers>=3.0.0
+newspaper3k>=0.2.8
+torch>=2.0.0

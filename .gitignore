@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# Environment variables — never commit API keys
+.env
+
+# Pipeline output files
+credit_signals_*.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old / superseded scripts
+new_scraper_early.py
+news_scraper.py
+sector_risk_keywords.json
