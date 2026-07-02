@@ -2,7 +2,6 @@
 
 > Automated NLP pipeline that scans daily financial news and surfaces the events most material to a company's S&P credit rating — replacing the manual analyst workflow of reading hundreds of articles per day.
 
-Built for **Joywin International Limited** · Quantitative Credit Research
 
 ---
 
