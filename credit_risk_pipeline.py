@@ -77,6 +77,28 @@ import datetime
 import torch
 
 
+def _load_dotenv():
+    """
+    Minimal .env loader (no external dependency). Reads KEY=VALUE lines from a
+    .env file in the script directory and populates os.environ for any key not
+    already set in the real environment. Silently does nothing if .env is absent.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_dotenv()
+
+
 # ==========================================
 # CONFIGURATION  -- edit these before running
 # ==========================================
@@ -105,12 +127,31 @@ TOP_N_OUTPUT            = 25    # maximum signals in the final report
 SCRAPE_WORKERS          = 15    # parallel threads for HTTP scraping
 MAX_ARTICLES            = 300   # cap on Finnhub articles fetched; None = no cap
 
-# --- LLM judge (Phase 4; uses your local Claude subscription) ---
+# --- LLM judge (Phase 4) ---
+# The judge can run through two backends, chosen at runtime:
+#   "claude"     -> local Claude Code CLI (claude -p); uses your subscription allowance
+#   "openrouter" -> OpenRouter HTTP API (pay-per-token); key from OPENROUTER_API_KEY
 USE_LLM_JUDGE        = True
-JUDGE_MODEL          = "haiku"
+JUDGE_BACKEND        = "claude"   # set interactively at startup
+JUDGE_MODEL          = "haiku"    # meaning depends on backend (CLI alias or OpenRouter slug)
 JUDGE_WORKERS        = 4
 JUDGE_TIMEOUT        = 120
 MIN_JUDGE_CONFIDENCE = 0.6
+
+# Runtime judge menu. Each entry: (label, backend, model_id).
+# OpenRouter cost estimates are per issuer (~25 articles); see README for method.
+JUDGE_CHOICES = [
+    ("Claude 3 Haiku    -- OpenRouter, ~$0.014/issuer (recommended)", "openrouter", "anthropic/claude-3-haiku"),
+    ("Claude Haiku      -- CLI, subscription",                        "claude",     "haiku"),
+    ("Claude Sonnet     -- CLI, subscription (higher accuracy)",      "claude",     "sonnet"),
+    ("DeepSeek V3.1     -- OpenRouter, ~$0.011/issuer",               "openrouter", "deepseek/deepseek-chat-v3.1"),
+    ("Gemini 2.5 Flash-Lite -- OpenRouter, ~$0.005/issuer",          "openrouter", "google/gemini-2.5-flash-lite"),
+    ("GPT-4o-mini       -- OpenRouter, ~$0.008/issuer",              "openrouter", "openai/gpt-4o-mini"),
+]
+
+# --- OpenRouter API (used when JUDGE_BACKEND == "openrouter") ---
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 # --- Credit score bands (5-tier; calibrate after more backtests) ---
 # Each tier maps to a likely S&P action type based on observed backtest scores.
@@ -415,6 +456,17 @@ _JUDGE_INSTRUCTIONS = (
     "risk, return risk_category='Neither' and material=false.\n"
     "'event_summary' must be ONE clear, self-contained sentence stating what actually "
     "happened (the event itself), readable without the original article.\n"
+    "Set 'confidence' using this rubric -- do NOT default to 0.8:\n"
+    "  0.90-1.00: Company is the primary subject; specific dated event with concrete "
+    "financial/operational figures; credit direction is unambiguous from a bondholder view; "
+    "criterion match is direct and tight.\n"
+    "  0.75-0.89: Company is directly involved but event is indirect or requires credit "
+    "inference; or direction is clear but article lacks hard figures; or criterion match "
+    "is strong but not exact.\n"
+    "  0.60-0.74: Industry-wide event where company-specific exposure is unclear; or "
+    "article is analyst opinion/forecast rather than reported fact; or credit direction "
+    "requires significant inference.\n"
+    "  Below 0.60: Very weak credit link -- set material=false instead.\n"
     "Respond with ONLY a JSON object, no preamble, no markdown fences:\n"
     '{"material": true/false, "risk_category": "Business Risk|Financial Risk|Neither", '
     '"sp_factor": "<short factor label>", "direction": "positive|negative|neutral", '
@@ -434,36 +486,80 @@ def build_judge_prompt(company, sector_name, matched_criterion, headline, articl
     )
 
 
-def _parse_judge_json(raw):
-    outer  = json.loads(raw)
-    result = outer.get("result", raw) if isinstance(outer, dict) else raw
-    if isinstance(result, dict):
-        return result
-    text  = str(result).strip()
+def _extract_json_obj(text):
+    """Pull the first JSON object out of a model's text output (handles fenced/prefixed)."""
+    text = str(text).strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:  # noqa: BLE001
+        pass
     fence = re.search(r"\{.*\}", text, re.DOTALL)
     if not fence:
         return None
     return json.loads(fence.group(0))
 
 
+def _parse_judge_json(raw):
+    """Parse the Claude CLI --output-format json envelope, then extract the verdict."""
+    outer  = json.loads(raw)
+    result = outer.get("result", raw) if isinstance(outer, dict) else raw
+    if isinstance(result, dict):
+        return result
+    return _extract_json_obj(result)
+
+
+def _judge_via_claude_cli(prompt):
+    """One judgment via the local Claude Code CLI. Raises on failure."""
+    cmd = [CLAUDE_BIN, "-p", prompt, "--model", JUDGE_MODEL,
+           "--output-format", "json", "--allowedTools", ""]
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        stdin=subprocess.DEVNULL, timeout=JUDGE_TIMEOUT,
+    )
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "non-zero exit").strip()[:200])
+    return _parse_judge_json(res.stdout.strip())
+
+
+def _judge_via_openrouter(prompt):
+    """One judgment via the OpenRouter HTTP API. Raises on failure."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
+    resp = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Joywin-International-Limited/credit-risk-news-scraper",
+            "X-Title": "Joywin Credit Risk Pipeline",
+        },
+        json={
+            "model": JUDGE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 500,
+        },
+        timeout=JUDGE_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    content = resp.json()["choices"][0]["message"]["content"]
+    return _extract_json_obj(content)
+
+
 def judge_article(company, sector_name, matched_criterion, headline, article_text):
     """
-    Run one local-Claude judgment on the full article text. Returns the verdict dict,
-    or None on failure (skipped rather than crashing the run). One retry.
+    Run one judgment on the full article text via the selected backend. Returns the
+    verdict dict, or None on failure (skipped rather than crashing the run). One retry.
     """
     prompt = build_judge_prompt(company, sector_name, matched_criterion, headline, article_text)
-    cmd    = [CLAUDE_BIN, "-p", prompt, "--model", JUDGE_MODEL,
-              "--output-format", "json", "--allowedTools", ""]
+    call   = _judge_via_openrouter if JUDGE_BACKEND == "openrouter" else _judge_via_claude_cli
 
     for attempt in (1, 2):
         try:
-            res = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8",
-                stdin=subprocess.DEVNULL, timeout=JUDGE_TIMEOUT,
-            )
-            if res.returncode != 0:
-                raise RuntimeError((res.stderr or res.stdout or "non-zero exit").strip()[:200])
-            verdict = _parse_judge_json(res.stdout.strip())
+            verdict = call(prompt)
             if verdict is None:
                 raise ValueError("no JSON object in judge output")
             return verdict
@@ -794,6 +890,23 @@ def _ask(prompt, default):
     return val if val else default
 
 
+def _choose_judge():
+    """Show the numbered judge menu and set JUDGE_BACKEND + JUDGE_MODEL globally."""
+    global JUDGE_BACKEND, JUDGE_MODEL
+    print("\n  Select the judge model (Phase 4):")
+    for i, (label, _, _) in enumerate(JUDGE_CHOICES, 1):
+        print(f"    {i}. {label}")
+    raw = input(f"\n  Choice [1-{len(JUDGE_CHOICES)}, default 1]: ").strip()
+    try:
+        idx = int(raw) - 1 if raw else 0
+        if not 0 <= idx < len(JUDGE_CHOICES):
+            raise ValueError
+    except ValueError:
+        print("  Invalid choice; using 1 (Claude Haiku CLI).")
+        idx = 0
+    _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
+
+
 def run_pipeline():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -811,15 +924,20 @@ def run_pipeline():
     COMPANY_NAME = _ask("Company name",   COMPANY_NAME)
     START_DATE   = _ask("Start date (YYYY-MM-DD)", START_DATE)
     END_DATE     = _ask("End date   (YYYY-MM-DD)", END_DATE)
-    JUDGE_MODEL  = _ask("Claude model (haiku / sonnet / opus)", JUDGE_MODEL)
+    _choose_judge()
 
     print()
     print(f"  Target : {COMPANY_NAME} ({TICKER})")
     print(f"  Period : {START_DATE}  ->  {END_DATE}")
-    print(f"  Model  : {JUDGE_MODEL}\n")
+    print(f"  Judge  : {JUDGE_MODEL}  ({JUDGE_BACKEND})\n")
 
     if FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY_HERE":
         print("ERROR: Set the FINNHUB_API_KEY environment variable before running.")
+        return
+
+    if JUDGE_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
+        print("ERROR: Set OPENROUTER_API_KEY (in .env or the environment) to use an "
+              "OpenRouter model.")
         return
 
     print("Loading NLP models...")
@@ -888,7 +1006,7 @@ def run_pipeline():
         print(f"  Full-text scraped : {scraped_count} | Summary fallback : {fallback_count}")
 
         # ── Phase 4: Local-Claude judge (one call per article) ────
-        print(f"\n[Phase 4] Local-Claude judge ({JUDGE_MODEL}, {JUDGE_WORKERS} workers)...")
+        print(f"\n[Phase 4] Judge: {JUDGE_MODEL} via {JUDGE_BACKEND} ({JUDGE_WORKERS} workers)...")
         all_signals = run_judge_articles(fetched_articles, COMPANY_NAME, target_sector["sector_name"])
         print(f"  Judged material : {len(all_signals)}")
 
@@ -998,6 +1116,7 @@ def run_pipeline():
         "mode":              "llm_judge" if USE_LLM_JUDGE else "cosine_only",
         "configuration": {
             "use_llm_judge":        USE_LLM_JUDGE,
+            "judge_backend":        JUDGE_BACKEND if USE_LLM_JUDGE else None,
             "judge_model":          JUDGE_MODEL if USE_LLM_JUDGE else None,
             "min_judge_confidence": MIN_JUDGE_CONFIDENCE if USE_LLM_JUDGE else None,
             "crossencoder_model":   CROSSENCODER_MODEL if USE_LLM_JUDGE else None,
