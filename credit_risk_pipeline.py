@@ -136,14 +136,15 @@ JUDGE_BACKEND        = "claude"   # set interactively at startup
 JUDGE_MODEL          = "haiku"    # meaning depends on backend (CLI alias or OpenRouter slug)
 JUDGE_WORKERS        = 4
 JUDGE_TIMEOUT        = 120
-MIN_JUDGE_CONFIDENCE = 0.6
+MIN_JUDGE_CONFIDENCE = 0.72  # cuts signals below 0.75-tier; reduces noise from borderline articles
 
 # Runtime judge menu. Each entry: (label, backend, model_id).
 # OpenRouter cost estimates are per issuer (~25 articles); see README for method.
 JUDGE_CHOICES = [
-    ("Claude 3 Haiku    -- OpenRouter, ~$0.014/issuer (recommended)", "openrouter", "anthropic/claude-3-haiku"),
+    ("Claude Haiku 4.5  -- OpenRouter, ~$0.03/issuer  (recommended)", "openrouter", "anthropic/claude-haiku-4.5"),
     ("Claude Haiku      -- CLI, subscription",                        "claude",     "haiku"),
     ("Claude Sonnet     -- CLI, subscription (higher accuracy)",      "claude",     "sonnet"),
+    ("Claude 3 Haiku    -- OpenRouter, ~$0.014/issuer (older model)", "openrouter", "anthropic/claude-3-haiku"),
     ("DeepSeek V3.1     -- OpenRouter, ~$0.011/issuer",               "openrouter", "deepseek/deepseek-chat-v3.1"),
     ("Gemini 2.5 Flash-Lite -- OpenRouter, ~$0.005/issuer",          "openrouter", "google/gemini-2.5-flash-lite"),
     ("GPT-4o-mini       -- OpenRouter, ~$0.008/issuer",              "openrouter", "openai/gpt-4o-mini"),
@@ -446,32 +447,43 @@ def is_primary_subject(paragraph, company_name, doc):
 # ==========================================
 
 _JUDGE_INSTRUCTIONS = (
-    "You are a senior S&P credit analyst. Decide whether this NEWS ARTICLE describes a "
-    "MATERIAL credit-rating event for the TARGET COMPANY, judged against the S&P sector "
-    "criterion provided. Be a strict skeptic: if the company is only mentioned in passing, "
-    "if it is generic market/stock commentary, or if you are unsure, set material=false.\n"
-    "Judge credit DIRECTION from the bondholder's view, NOT general tone -- e.g. new debt "
-    "issuance or a debt-funded acquisition is usually 'negative' for credit even if upbeat.\n"
-    "Base 'sp_factor' on the provided criterion. If it fits neither business nor financial "
-    "risk, return risk_category='Neither' and material=false.\n"
+    "You are a senior S&P credit analyst assessing BONDHOLDER risk, NOT equity upside. "
+    "Decide whether this NEWS ARTICLE describes a MATERIAL credit-rating event for the "
+    "TARGET COMPANY, judged against the S&P sector criterion provided.\n"
+    "\n"
+    "STRICT MATERIALITY RULES -- set material=false if ANY of these apply:\n"
+    "  - Company is only mentioned in passing or alongside many other companies\n"
+    "  - Article is generic market/macro commentary with no company-specific figures\n"
+    "  - Industry-wide policy change (tariffs, regulations) with no quantified impact "
+    "on this company specifically\n"
+    "  - New product launch or investment announcement with no concrete financial "
+    "figures (revenue, margins, debt impact) -- speculative future benefit is NOT material\n"
+    "  - Analyst rating change on the stock (equity signal, not credit signal)\n"
+    "\n"
+    "BONDHOLDER DIRECTION RULES -- judge from the creditor's view, not the shareholder's:\n"
+    "  NEGATIVE: debt issuance, large capex commitments, acquisitions, production declines, "
+    "margin compression, market share loss, leverage increase, liquidity pressure\n"
+    "  POSITIVE: debt repayment, cost cuts with confirmed savings, capacity utilisation "
+    "recovery with concrete figures, refinancing at lower rates, asset disposal reducing debt\n"
+    "  NEUTRAL: product launches (future benefit unproven), supplier partnerships, "
+    "workforce expansions (capex outflow), regulatory relief affecting the whole industry\n"
+    "\n"
+    "Set 'confidence' using this rubric -- do NOT default to a round number:\n"
+    "  0.90-1.00: Company is primary subject; specific dated event with concrete financial "
+    "figures; credit direction unambiguous from bondholder view; criterion match is direct\n"
+    "  0.75-0.89: Company directly involved; direction clear but article lacks hard figures; "
+    "or criterion match is strong but not exact\n"
+    "  0.60-0.74: Indirect or industry-wide event; company-specific credit impact requires "
+    "significant inference; or article is opinion/forecast not reported fact\n"
+    "  Below 0.60: set material=false instead\n"
+    "\n"
     "'event_summary' must be ONE clear, self-contained sentence stating what actually "
-    "happened (the event itself), readable without the original article.\n"
-    "Set 'confidence' using this rubric -- do NOT default to 0.8:\n"
-    "  0.90-1.00: Company is the primary subject; specific dated event with concrete "
-    "financial/operational figures; credit direction is unambiguous from a bondholder view; "
-    "criterion match is direct and tight.\n"
-    "  0.75-0.89: Company is directly involved but event is indirect or requires credit "
-    "inference; or direction is clear but article lacks hard figures; or criterion match "
-    "is strong but not exact.\n"
-    "  0.60-0.74: Industry-wide event where company-specific exposure is unclear; or "
-    "article is analyst opinion/forecast rather than reported fact; or credit direction "
-    "requires significant inference.\n"
-    "  Below 0.60: Very weak credit link -- set material=false instead.\n"
+    "happened, readable without the original article.\n"
     "Respond with ONLY a JSON object, no preamble, no markdown fences:\n"
     '{"material": true/false, "risk_category": "Business Risk|Financial Risk|Neither", '
     '"sp_factor": "<short factor label>", "direction": "positive|negative|neutral", '
     '"confidence": 0.0-1.0, "event_summary": "<one sentence: what happened>", '
-    '"rationale": "<one sentence: why it is credit-material>"}'
+    '"rationale": "<one sentence: why it is credit-material for a bondholder>"}'
 )
 
 
