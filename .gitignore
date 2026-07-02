@@ -14,8 +14,8 @@ env/
 # Environment variables — never commit API keys
 .env
 
-# Pipeline output files
-credit_signals_*.json
+# Pipeline output files (kept in results/ folder, not committed)
+results/credit_signals_*.json
 
 # IDE
 .vscode/
@@ -29,3 +29,7 @@ Thumbs.db
 new_scraper_early.py
 news_scraper.py
 sector_risk_keywords.json
+
+# Claude Code local files (personal settings & memory — never commit)
+.claude/
+memory/
