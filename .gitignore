@@ -33,3 +33,7 @@ sector_risk_keywords.json
 # Claude Code local files (personal settings & memory — never commit)
 .claude/
 memory/
+
+# Licensed / proprietary source data — never commit (S&P criteria PDFs, LSEG exports)
+*.pdf
+ratings_history.csv

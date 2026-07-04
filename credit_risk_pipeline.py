@@ -65,6 +65,7 @@ Dependencies
 import os
 import re
 import sys
+import textwrap
 import subprocess
 import requests
 import yfinance as yf
@@ -73,7 +74,10 @@ from newspaper import Article
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import json
+import math
+import random
 import datetime
+import time
 import torch
 
 
@@ -112,7 +116,9 @@ END_DATE        = "2026-06-30"
 
 # --- Cross-encoder relevance filter (judge path, Phase 2) ---
 CROSSENCODER_MODEL  = "cross-encoder/ms-marco-MiniLM-L6-v2"
-CROSSENCODER_TOP_N  = 25    # articles forwarded to Claude after CE filter
+CROSSENCODER_TOP_N  = 40    # articles forwarded to Claude after CE filter
+                            # (raised 25->40: 2-3 material signals per run was too thin
+                            #  for a reliable score; ~$0.05/issuer at Haiku-4.5 rates)
 MAX_ARTICLE_CHARS   = 4000  # character limit for article text sent to the judge
 
 # --- Legacy cosine gate (used ONLY when USE_LLM_JUDGE = False) ---
@@ -124,8 +130,68 @@ MIN_PARAGRAPH_WORDS     = 20
 MAX_SIGNALS_PER_ARTICLE = 2     # cap per article (legacy path)
 DEDUP_THRESHOLD         = 0.88  # cosine score above which two signals are near-duplicates
 TOP_N_OUTPUT            = 25    # maximum signals in the final report
+
+# --- Event-level dedup (judge path): one event -> one vote, weighted by coverage ---
+# Reworded copies from many outlets, and the same event split across Business/Financial
+# Risk, previously each voted separately and inflated the score (the CE / UPS misses).
+# We cluster same-event signals and collapse them to ONE reconciled vote; coverage (how
+# many outlets carried it) becomes a mild weight, so a widely-covered event still counts
+# more without being counted multiple times.
+EVENT_CLUSTER_SIM   = 0.50   # event_summary cosine >= this (within the day window) = same event
+EVENT_CLUSTER_DAYS  = 3      # only merge same-event reads dated within N days of each other
+COVERAGE_WEIGHT_K   = 0.25   # coverage multiplier w = 1 + K*ln(outlets); 5 outlets ~ x1.40 (mild)
+COVERAGE_WEIGHT_MAX = 1.75   # cap so one viral story cannot dominate the score
 SCRAPE_WORKERS          = 15    # parallel threads for HTTP scraping
 MAX_ARTICLES            = 300   # cap on Finnhub articles fetched; None = no cap
+
+# --- Supplementary news sources (free, no API key), merged with the Finnhub feed ---
+# GDELT DOC API is the recommended second source: query-scoped to the company (less noisy
+# than Finnhub's ticker firehose) and returns REAL publisher URLs that scrape to full text.
+# Google News RSS is available but OFF by default -- its base64 links don't resolve (judge
+# sees only the snippet) and it is heavy on the company's own newsroom PR.
+USE_FINNHUB     = True
+USE_GDELT       = True
+USE_GOOGLE_NEWS = False
+GDELT_MAX       = 100   # cap on GDELT items pulled per run (API max 250)
+GOOGLE_NEWS_MAX = 100   # cap on Google News items pulled per run
+
+# --- Bootstrap uncertainty band (Phase 5 scoring) ---
+BOOTSTRAP_RESAMPLES     = 1000  # resamples of the signal set for the score band
+MIN_BOOTSTRAP_SIGNALS   = 4     # below this the band is not statistically meaningful
+BOOTSTRAP_SEED          = 42    # fixed seed -> reproducible band for the same signals
+
+# --- Market snapshot as of end date (Phase 5b) ---
+USE_MARKET_SNAPSHOT     = True
+MARKET_BENCHMARK        = "^GSPC"   # benchmark for the window abnormal-return calc
+
+# --- Deterministic Financial-Risk channel from quarterly filings (Phase 5c) ---
+# Adds a leverage-trend Financial Risk signal computed straight from yfinance quarterly
+# statements -- no news, no LLM. Catches quiet balance-sheet moves that never make
+# headlines (the ADEA deleveraging / WBD zero-news blind spots) and fires even when the
+# news channel returns nothing. Only emits a signal when the trend is material.
+USE_FILINGS_FR          = True
+FILINGS_FR_MIN_CHANGE   = 0.10   # net-debt change over the window must exceed +/-10% to signal
+FILINGS_FR_MAX_CONF     = 0.90   # confidence cap for the deterministic signal
+
+# --- Always-on quarterly fundamentals panel (descriptive, not scored) ---
+# Prints the key credit metrics and their trend every run (revenue, net income, margins,
+# EBITDA, free cash flow, debt, net debt) from yfinance quarterly statements -- so the
+# analyst always sees the financial picture even when no news/leverage SIGNAL fires.
+USE_FINANCIAL_PANEL      = True
+FINANCIAL_PANEL_QUARTERS = 4     # number of recent quarters shown side by side
+# Negative-biased on purpose: rising leverage is a reliable credit warning, but FALLING
+# leverage is NOT reliable evidence of improvement -- it routinely coexists with a downgrade
+# driven by strategy/litigation/sector (observed: PSKY deleveraged 10% into a CreditWatch
+# negative). Emitting a positive here creates false-positive upgrades, so we stay silent on
+# deleveraging until we have EDGAR-grade data. Set False to also emit positive signals.
+FILINGS_FR_NEGATIVE_ONLY = True
+
+# --- Point-in-time financials (Phase 1) ---
+# Use the latest quarterly statement whose period-end is on/before END_DATE. yfinance
+# only returns quarters that have actually been reported, so for a live run this is the
+# newest public filing (e.g. Micron Q3 once earnings are out). Set >0 to re-impose a
+# reporting-lag guard for strict point-in-time backtests (accepts mild look-ahead at 0).
+FINANCIALS_REPORTING_LAG_DAYS = 0
 
 # --- LLM judge (Phase 4) ---
 # The judge can run through two backends, chosen at runtime:
@@ -134,9 +200,24 @@ MAX_ARTICLES            = 300   # cap on Finnhub articles fetched; None = no cap
 USE_LLM_JUDGE        = True
 JUDGE_BACKEND        = "claude"   # set interactively at startup
 JUDGE_MODEL          = "haiku"    # meaning depends on backend (CLI alias or OpenRouter slug)
-JUDGE_WORKERS        = 4
+JUDGE_WORKERS        = 6    # raised 4->6 to keep latency flat with TOP_N at 40
 JUDGE_TIMEOUT        = 120
-MIN_JUDGE_CONFIDENCE = 0.72  # cuts signals below 0.75-tier; reduces noise from borderline articles
+MIN_JUDGE_CONFIDENCE = 0.65  # was 0.72; 0.65 keeps the credit signal rigorous, slightly more inclusive
+
+# --- Sector routing ---
+# Ask the judge LLM to map the Yahoo Finance industry (+ business summary) to the single
+# best S&P sector. Replaces the embedding match that mis-routed some names on superficial
+# word overlap (Stanley Black & Decker -> "Forest And Paper Products"; Brown-Forman likewise
+# via cooperage/barrel language). Falls back to the embedding/override router if the LLM is
+# unavailable or returns an off-list answer. One cheap extra LLM call per run.
+USE_LLM_SECTOR_ROUTING = True
+
+# SECONDARY equity/market news section only (NOT credit-scored). Credit-relevant news IS the
+# primary BR/FR signal report; it is not repeated here. Shows the top few equity stories by
+# coverage, each with a one-line summary. SHOW_EQUITY_NEWS hides it (CLI 6th arg "noequity").
+SHOW_EQUITY_NEWS     = True
+DIGEST_TOP_EQUITY    = 3      # equity/market stories shown (secondary)
+DIGEST_CLUSTER_SIM   = 0.60   # headline cosine >= this = same story, different outlet
 
 # Runtime judge menu. Each entry: (label, backend, model_id).
 # OpenRouter cost estimates are per issuer (~25 articles); see README for method.
@@ -153,6 +234,13 @@ JUDGE_CHOICES = [
 # --- OpenRouter API (used when JUDGE_BACKEND == "openrouter") ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+
+# --- Evidence shrinkage for the credit score ---
+# score = raw_score x n/(n+K). Pulls the score toward 0 when it rests on few signals,
+# so a unanimous 2-signal run no longer pins the -1.0/+1.0 ceiling. With K=2:
+# n=2 -> x0.50, n=3 -> x0.60, n=8 -> x0.80. Fixes "LOW-conviction -1.0 looks as
+# strong as HIGH-conviction -1.0" without touching the band boundaries.
+SCORE_SHRINKAGE_K = 2
 
 # --- Credit score bands (5-tier; calibrate after more backtests) ---
 # Each tier maps to a likely S&P action type based on observed backtest scores.
@@ -306,20 +394,282 @@ SECTOR_OVERRIDES = {
 # PHASE 1 HELPER: SECTOR ROUTING
 # ==========================================
 
-def match_sp_sector(industry, sp_criteria_master):
+def yf_symbol(ticker):
+    """yfinance uses '-' for share classes where Finnhub / RIC feeds use '.'
+    (BF.B -> BF-B, MOG.A -> MOG-A). Finnhub keeps the dot; yfinance needs the dash."""
+    return (ticker or "").replace(".", "-")
+
+
+def match_sp_sector(industry, business_summary, sp_criteria_master, encoder):
+    """
+    Route the company to the S&P sector whose credit criteria best describe its actual
+    business. Builds a query from the company's business summary (+ Yahoo industry) and
+    semantically matches it against each S&P sector document (sector name + all its
+    business/financial risk criteria). This fixes conglomerates a single Yahoo industry
+    label routes poorly -- e.g. Amazon ("Internet Retail") whose criteria span retail and
+    cloud, previously hard-forced to "Retail And Restaurants".
+
+    Returns (best_sector_dict, ranked_top3) where ranked_top3 is [(sector_name, score)]
+    for transparency. Falls back to legacy name word-overlap if summary/encoder missing.
+    """
+    sectors = sp_criteria_master["sectors"]
+
+    query = " ".join(x for x in (business_summary or "", industry or "") if x).strip()
+    if query and encoder is not None:
+        try:
+            sector_docs = [
+                s["sector_name"] + ". " + " ".join(
+                    s.get("business_risk_keywords", []) + s.get("financial_risk_keywords", []))
+                for s in sectors
+            ]
+            q_vec  = encoder.encode(query[:2000], convert_to_tensor=True)
+            d_vecs = encoder.encode(sector_docs, convert_to_tensor=True)
+            sims   = util.cos_sim(q_vec, d_vecs)[0]
+            ranked = sorted(
+                ((sectors[i], float(sims[i])) for i in range(len(sectors))),
+                key=lambda x: x[1], reverse=True,
+            )
+            return ranked[0][0], [(s["sector_name"], round(sc, 3)) for s, sc in ranked[:3]]
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fallback: legacy name word-overlap via the override map.
     mapped      = SECTOR_OVERRIDES.get(industry, industry)
     best_score  = 0
-    best_sector = sp_criteria_master["sectors"][0]
-
-    for sector in sp_criteria_master["sectors"]:
+    best_sector = sectors[0]
+    for sector in sectors:
         yf_words = set(mapped.replace("&", "").replace(",", "").split())
         sp_words = set(sector["sector_name"].replace("And", "").replace(",", "").split())
         score    = len(yf_words & sp_words)
         if score > best_score:
             best_score  = score
             best_sector = sector
+    return best_sector, [(best_sector["sector_name"], best_score)]
 
-    return best_sector
+
+def build_sector_routing_prompt(company_name, industry, business_summary, sector_names):
+    joined = "\n".join(f"- {n}" for n in sector_names)
+    return (
+        "You map a company to the single S&P sector whose credit-rating criteria best fit "
+        "its core business.\n"
+        f"COMPANY: {company_name}\n"
+        f"YAHOO FINANCE INDUSTRY: {industry}\n"
+        f"BUSINESS SUMMARY: {(business_summary or '')[:800]}\n\n"
+        "Pick the ONE best sector from the list below. Judge by what the company actually "
+        "does, not superficial word overlap (e.g. a toolmaker is Capital Goods, not Forest "
+        "& Paper Products just because it sells to builders).\n"
+        f"S&P SECTORS:\n{joined}\n\n"
+        "Respond with ONLY compact JSON and nothing else: "
+        '{"sector": "<exact sector name copied from the list>"}'
+    )
+
+
+def match_sp_sector_llm(company_name, industry, business_summary, sp_criteria_master):
+    """
+    Ask the configured judge LLM to map the company to the best-matching S&P sector.
+    Returns (sector_dict, [(sector_name, 1.0)]), or None on any failure so the caller can
+    fall back to the embedding/override router. Reuses the judge backend; one cheap call.
+    Matches the model's answer to a real sector name (exact -> case-insensitive -> substring)
+    so an off-list or slightly reworded answer never silently routes to the wrong bucket.
+    """
+    sectors = sp_criteria_master["sectors"]
+    names   = [s["sector_name"] for s in sectors]
+    prompt  = build_sector_routing_prompt(company_name, industry, business_summary, names)
+    call    = _judge_via_openrouter if JUDGE_BACKEND == "openrouter" else _judge_via_claude_cli
+    try:
+        verdict = call(prompt)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    choice = str(verdict.get("sector", "")).strip()
+    if not choice:
+        return None
+
+    low = choice.lower()
+    picked = next((s for n, s in zip(names, sectors) if n == choice), None)
+    if picked is None:
+        picked = next((s for n, s in zip(names, sectors) if n.lower() == low), None)
+    if picked is None:
+        picked = next((s for n, s in zip(names, sectors)
+                       if low in n.lower() or n.lower() in low), None)
+    if picked is None:
+        return None
+    return picked, [(picked["sector_name"], 1.0)]
+
+
+# ==========================================
+# PHASE 1 HELPER: ENTITY (IS-IT-ABOUT-US) GATE
+# ==========================================
+
+_COMPANY_NAME_SUFFIXES = {
+    "inc", "incorporated", "corp", "corporation", "company", "co", "ltd", "limited",
+    "holdings", "holding", "group", "plc", "nv", "sa", "ag", "technologies",
+    "technology", "com", "the", "and", "systems", "international",
+}
+
+
+def build_entity_matcher(company_name, ticker):
+    """
+    Return a predicate article -> bool that decides whether an article is actually ABOUT
+    this issuer. Aliases = significant tokens of the company name (suffixes like
+    Inc/Corp/.com stripped, matched as whole words); the ticker is matched separately as
+    a CASE-SENSITIVE whole word so short tickers (BA, CE, MU) don't match lowercase
+    substrings ("ba" in "bank"). Finnhub tags a lot of generic market commentary to
+    mega-cap tickers (e.g. ~66% of Amazon's feed never names Amazon) -- this gate removes
+    that noise before it can fill the Phase 2 top-N with irrelevant articles.
+    """
+    tokens  = [t.lower() for t in re.split(r"[^A-Za-z0-9]+", company_name or "") if t]
+    aliases = [t for t in tokens if len(t) >= 3 and t not in _COMPANY_NAME_SUFFIXES]
+    name_re = (re.compile(r"\b(" + "|".join(re.escape(a) for a in aliases) + r")\b",
+                          re.IGNORECASE) if aliases else None)
+    ticker_re = re.compile(r"\b" + re.escape(ticker) + r"\b") if ticker else None
+
+    def is_about(article):
+        text = f"{article.get('headline', '') or ''} {article.get('summary', '') or ''}"
+        return bool((name_re and name_re.search(text))
+                    or (ticker_re and ticker_re.search(text)))
+
+    return is_about
+
+
+# ==========================================
+# PHASE 1 HELPER: SUPPLEMENTARY NEWS (GOOGLE NEWS RSS)
+# ==========================================
+
+def fetch_google_news(company_name, ticker, start_date, end_date, max_items=GOOGLE_NEWS_MAX):
+    """
+    Supplementary free news via Google News RSS (no API key). Returns Finnhub-shaped dicts
+    {headline, summary, url, datetime, source} so results merge straight into the pipeline.
+    The query is scoped to the company + date window, so it is much less noisy than Finnhub's
+    ticker-tagged feed. Google links are redirects; the scraper resolves them to the real
+    publisher URL like it does Finnhub's. Best-effort: returns [] on any failure.
+    """
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    from urllib.parse import quote
+
+    query = f"{company_name} after:{start_date} before:{end_date}"
+    url   = ("https://news.google.com/rss/search?q=" + quote(query)
+             + "&hl=en-US&gl=US&ceid=US:en")
+    try:
+        r = requests.get(url, timeout=12, headers=_SCRAPE_HEADERS)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception:  # noqa: BLE001
+        return []
+
+    out = []
+    for it in root.iter("item"):
+        title  = (it.findtext("title") or "").strip()
+        link   = (it.findtext("link") or "").strip()
+        desc   = it.findtext("description") or ""
+        pub    = it.findtext("pubDate") or ""
+        src_el = it.find("source")
+        source = (src_el.text if src_el is not None else "") or ""
+
+        # Google News titles are "Headline - Publisher"; split out the publisher.
+        headline = title
+        if source and title.endswith(f"- {source}"):
+            headline = title[: -(len(source) + 2)].strip(" -")
+        elif not source and " - " in title:
+            headline, _, source = title.rpartition(" - ")
+
+        summary = re.sub(r"<[^>]+>", " ", desc)
+        summary = re.sub(r"\s+", " ", summary).strip()[:300]
+        try:
+            epoch = int(parsedate_to_datetime(pub).timestamp())
+        except Exception:  # noqa: BLE001
+            epoch = 0
+
+        if not headline:
+            continue
+        out.append({
+            "headline": headline,
+            "summary":  summary or headline,
+            "url":      link,
+            "datetime": epoch,
+            "source":   source or "Google News",
+        })
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT_MAX):
+    """
+    Supplementary free news via the GDELT DOC 2.0 API (no API key). Returns Finnhub-shaped
+    dicts with REAL publisher URLs (unlike Google News' base64 redirects), so the judge can
+    read full article text. English sources only; date-windowed. GDELT carries no per-article
+    snippet, so the title doubles as the summary. Best-effort: returns [] on any failure.
+    """
+    from urllib.parse import quote
+
+    def _stamp(d, tail):
+        return d.replace("-", "") + tail
+
+    query = f'"{company_name}" sourcelang:english'
+    url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + quote(query)
+           + "&mode=ArtList&format=json&sort=DateDesc"
+           + f"&maxrecords={min(250, max_items)}"
+           + f"&startdatetime={_stamp(start_date, '000000')}"
+           + f"&enddatetime={_stamp(end_date, '235959')}")
+    # GDELT rate-limits to ~1 request / 5s; retry once after a pause on HTTP 429.
+    arts = []
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, timeout=20, headers=_SCRAPE_HEADERS)
+            if r.status_code == 429:
+                if attempt == 1:
+                    time.sleep(5)
+                    continue
+                return []
+            r.raise_for_status()
+            arts = r.json().get("articles", []) or []
+            break
+        except Exception:  # noqa: BLE001
+            if attempt == 2:
+                return []
+            time.sleep(5)
+
+    out = []
+    for a in arts:
+        title = (a.get("title") or "").strip()
+        link  = (a.get("url") or "").strip()
+        if not title or not link:
+            continue
+        sd = (a.get("seendate") or "").replace("T", "").replace("Z", "")
+        try:
+            epoch = int(datetime.datetime.strptime(sd[:14], "%Y%m%d%H%M%S").timestamp())
+        except Exception:  # noqa: BLE001
+            epoch = 0
+        out.append({
+            "headline": title,
+            "summary":  title,          # GDELT has no snippet; title doubles as summary
+            "url":      link,
+            "datetime": epoch,
+            "source":   a.get("domain", "") or "GDELT",
+        })
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def merge_news(*sources):
+    """
+    Merge news lists from multiple providers, de-duplicating by normalized headline so the
+    same story carried by two feeds counts once. Preserves first-seen order (pass the
+    provider you trust most first).
+    """
+    seen, out = set(), []
+    for src in sources:
+        for a in (src or []):
+            key = re.sub(r"\W+", "", (a.get("headline", "") or "")).lower()[:90]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(a)
+    return out
 
 
 # ==========================================
@@ -337,11 +687,12 @@ def _get_cross_encoder():
     return _CROSS_ENCODER
 
 
-def filter_with_crossencoder(news_data, criteria_texts, criteria_labels):
+def filter_with_crossencoder(news_data, criteria_texts, criteria_labels, top_n=CROSSENCODER_TOP_N):
     """
     Scores each article's headline + summary against every S&P criterion for the
-    sector using a cross-encoder. Returns the top CROSSENCODER_TOP_N articles by
-    max criterion score, each annotated with matched_criterion and risk_category.
+    sector using a cross-encoder. Returns the top `top_n` articles by max criterion
+    score, each annotated with matched_criterion and risk_category. Pass top_n =
+    len(news_data) to annotate+sort without dropping any (judge-all mode).
 
     Cross-encoders read both texts jointly (unlike cosine which compares embeddings
     in isolation), giving much better signal on whether the headline actually relates
@@ -373,7 +724,7 @@ def filter_with_crossencoder(news_data, criteria_texts, criteria_labels):
         })
 
     results.sort(key=lambda x: x["_ce_score"], reverse=True)
-    return results[:CROSSENCODER_TOP_N]
+    return results[:top_n]
 
 
 # ==========================================
@@ -392,20 +743,26 @@ _SCRAPE_HEADERS = {
 def scrape_full_text(url, fallback_summary):
     """
     Downloads raw HTML via requests (8-second hard timeout) then passes it to
-    newspaper3k for local parsing. Returns the Finnhub summary fallback if scraping
-    fails or yields fewer than 100 words.
+    newspaper3k for local parsing. Returns (text, resolved_url).
+
+    resolved_url follows Finnhub's `finnhub.io/api/news?id=...` redirect to the real
+    publisher article (requests follows the 302 automatically), so the stored/displayed
+    source link is actually clickable instead of a dead API URL. Falls back to the Finnhub
+    summary text, and to the original url, when the request fails.
     """
+    final_url = url
     try:
         response = requests.get(url, timeout=8, headers=_SCRAPE_HEADERS)
+        final_url = response.url or url          # resolved publisher URL after redirects
         response.raise_for_status()
-        article = Article(url)
+        article = Article(final_url)
         article.set_html(response.text)
         article.parse()
         if len(article.text.split()) > 100:
-            return article.text
+            return article.text, final_url
     except Exception:
         pass
-    return fallback_summary
+    return fallback_summary, final_url
 
 
 def extract_paragraphs(text):
@@ -458,15 +815,30 @@ _JUDGE_INSTRUCTIONS = (
     "on this company specifically\n"
     "  - New product launch or investment announcement with no concrete financial "
     "figures (revenue, margins, debt impact) -- speculative future benefit is NOT material\n"
-    "  - Analyst rating change on the stock (equity signal, not credit signal)\n"
+    "  - Analyst stock rating or price-target change (equity signal, not credit signal)\n"
+    "  - Results merely MISSED or BEAT ANALYST ESTIMATES: the gap vs expectations is an "
+    "equity signal, not a credit event. Judge only the REPORTED figures themselves -- "
+    "material only if they show real deterioration or improvement in cash generation, "
+    "liquidity, or leverage\n"
     "\n"
     "BONDHOLDER DIRECTION RULES -- judge from the creditor's view, not the shareholder's:\n"
     "  NEGATIVE: debt issuance, large capex commitments, acquisitions, production declines, "
     "margin compression, market share loss, leverage increase, liquidity pressure\n"
     "  POSITIVE: debt repayment, cost cuts with confirmed savings, capacity utilisation "
-    "recovery with concrete figures, refinancing at lower rates, asset disposal reducing debt\n"
+    "recovery with concrete figures, refinancing at lower rates, asset disposal reducing "
+    "debt. ALSO POSITIVE: demonstrated operating improvement backed by REPORTED figures -- "
+    "sustained revenue/bookings growth, positive and growing free cash flow, margin "
+    "expansion, guidance raised on delivered results. Improving cash generation IS "
+    "credit-positive; do not dismiss it as equity hype when the figures are reported fact\n"
     "  NEUTRAL: product launches (future benefit unproven), supplier partnerships, "
     "workforce expansions (capex outflow), regulatory relief affecting the whole industry\n"
+    "\n"
+    "BALANCE-SHEET CONTEXT: when a COMPANY DEBT CONTEXT line is provided, weigh Financial "
+    "Risk direction against the actual debt load. For a company with little debt or net "
+    "cash, a profitability wobble is rarely credit-material; for a leveraged company the "
+    "same wobble can be severe. Never claim debt-service pressure without evidence of "
+    "real strain on cash, liquidity, or leverage. Use this context ONLY to judge -- do "
+    "NOT restate its figures in event_summary or rationale.\n"
     "\n"
     "Set 'confidence' using this rubric -- do NOT default to a round number:\n"
     "  0.90-1.00: Company is primary subject; specific dated event with concrete financial "
@@ -477,21 +849,57 @@ _JUDGE_INSTRUCTIONS = (
     "significant inference; or article is opinion/forecast not reported fact\n"
     "  Below 0.60: set material=false instead\n"
     "\n"
-    "'event_summary' must be ONE clear, self-contained sentence stating what actually "
+    "'event_summary' must be ONE concise sentence (max ~30 words) stating what actually "
     "happened, readable without the original article.\n"
-    "Respond with ONLY a JSON object, no preamble, no markdown fences:\n"
+    "'rationale' must be ONE concise sentence (max ~35 words): why it is credit-material "
+    "for a bondholder. Do NOT restate the company's overall revenue or debt totals in it.\n"
+    "'key_figures': the hard numbers stated in the article that bear on credit (dollar "
+    "amounts, percentages, ratios). Each is a short {\"metric\", \"value\"} pair using ONLY "
+    "numbers present in the text -- never invent or round. Put NO quotation marks inside "
+    "metric or value. Use an empty list [] if the article states none.\n"
+    "\n"
+    "Respond with ONLY a compact single-line JSON object -- no preamble, no markdown fences, "
+    "no newlines inside the JSON:\n"
     '{"material": true/false, "risk_category": "Business Risk|Financial Risk|Neither", '
     '"sp_factor": "<short factor label>", "direction": "positive|negative|neutral", '
-    '"confidence": 0.0-1.0, "event_summary": "<one sentence: what happened>", '
-    '"rationale": "<one sentence: why it is credit-material for a bondholder>"}'
+    '"confidence": 0.0-1.0, '
+    '"key_figures": [{"metric": "<short label>", "value": "<number as written>"}], '
+    '"event_summary": "<one concise sentence>", '
+    '"rationale": "<one concise sentence>"}'
 )
 
 
-def build_judge_prompt(company, sector_name, matched_criterion, headline, article_text):
+def verify_figures(key_figures, article_text):
+    """
+    Anti-hallucination guard: keep only figures whose numeric value provably appears
+    in the source article text (comma-insensitive), and drop the rest. Deterministic
+    (no model involved) -- a number the judge invented cannot survive this check, so
+    every figure that reaches the report is literally present in its source article.
+    """
+    if not key_figures or not article_text:
+        return []
+    text_norm = article_text.replace(",", "")
+    verified  = []
+    for f in key_figures:
+        if not isinstance(f, dict):
+            continue
+        value = str(f.get("value", "")).strip()
+        nums  = re.findall(r"\d[\d,]*(?:\.\d+)?", value)
+        if not nums:
+            continue
+        if all(n.replace(",", "") in text_norm for n in nums):
+            verified.append({"metric": str(f.get("metric", "")).strip(), "value": value})
+    return verified
+
+
+def build_judge_prompt(company, sector_name, matched_criterion, headline, article_text,
+                       debt_context=""):
+    debt = f"COMPANY DEBT CONTEXT: {debt_context}\n" if debt_context else ""
     return (
         f"{_JUDGE_INSTRUCTIONS}\n\n"
         f"TARGET COMPANY: {company}\n"
         f"S&P SECTOR: {sector_name}\n"
+        f"{debt}"
         f"MATCHED S&P CRITERION:\n{matched_criterion}\n\n"
         f"NEWS HEADLINE: {headline}\n"
         f"FULL ARTICLE:\n{article_text[:MAX_ARTICLE_CHARS]}"
@@ -499,18 +907,25 @@ def build_judge_prompt(company, sector_name, matched_criterion, headline, articl
 
 
 def _extract_json_obj(text):
-    """Pull the first JSON object out of a model's text output (handles fenced/prefixed)."""
+    """Pull the first JSON object out of a model's text output. Tolerates code fences,
+    text before the object, and trailing commentary AFTER it -- raw_decode() parses the
+    first balanced object and ignores whatever follows, so a stray sentence appended by
+    the model no longer drops the whole article (was: greedy regex -> 'Extra data')."""
     text = str(text).strip()
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:  # noqa: BLE001
-        pass
-    fence = re.search(r"\{.*\}", text, re.DOTALL)
-    if not fence:
-        return None
-    return json.loads(fence.group(0))
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        start = text.find("{", start + 1)
+    return None
 
 
 def _parse_judge_json(raw):
@@ -561,12 +976,14 @@ def _judge_via_openrouter(prompt):
     return _extract_json_obj(content)
 
 
-def judge_article(company, sector_name, matched_criterion, headline, article_text):
+def judge_article(company, sector_name, matched_criterion, headline, article_text,
+                  debt_context=""):
     """
     Run one judgment on the full article text via the selected backend. Returns the
     verdict dict, or None on failure (skipped rather than crashing the run). One retry.
     """
-    prompt = build_judge_prompt(company, sector_name, matched_criterion, headline, article_text)
+    prompt = build_judge_prompt(company, sector_name, matched_criterion, headline,
+                                article_text, debt_context)
     call   = _judge_via_openrouter if JUDGE_BACKEND == "openrouter" else _judge_via_claude_cli
 
     for attempt in (1, 2):
@@ -582,7 +999,7 @@ def judge_article(company, sector_name, matched_criterion, headline, article_tex
     return None
 
 
-def run_judge_articles(articles, company, sector_name):
+def run_judge_articles(articles, company, sector_name, debt_context=""):
     """
     Judge all filtered articles in parallel. Each article dict must have full_text,
     matched_criterion, headline keys. Returns the subset the judge marks material
@@ -594,6 +1011,7 @@ def run_judge_articles(articles, company, sector_name):
             article["matched_criterion"],
             article.get("headline", ""),
             article.get("full_text", ""),
+            debt_context,
         )
         if not verdict or not verdict.get("material"):
             return None
@@ -610,6 +1028,8 @@ def run_judge_articles(articles, company, sector_name):
             "sp_factor":     verdict.get("sp_factor", ""),
             "direction":     verdict.get("direction", "neutral"),
             "confidence":    round(confidence, 3),
+            "key_figures":   verify_figures(verdict.get("key_figures", []),
+                                            article.get("full_text", "")),
             "event_summary": verdict.get("event_summary", ""),
             "rationale":     verdict.get("rationale", ""),
         })
@@ -719,9 +1139,288 @@ def deduplicate(signals, encoder):
     return [s for i, s in enumerate(signals) if keep[i]]
 
 
+def find_contradictions(signals):
+    """
+    Flag pairs of signals dated the same day with opposite directions -- usually one
+    event (e.g. an earnings release) read two ways by different outlets. These inflate
+    apparent coverage while cancelling in the score; the analyst should reconcile them.
+    Returns a list of (ref_a, ref_b) display numbers.
+    """
+    pairs = []
+    for i in range(len(signals)):
+        for j in range(i + 1, len(signals)):
+            a, b = signals[i], signals[j]
+            if (a.get("date") == b.get("date")
+                    and {a.get("direction"), b.get("direction")} == {"positive", "negative"}):
+                pairs.append((a.get("ref", i + 1), b.get("ref", j + 1)))
+    return pairs
+
+
+def cluster_events(signals, encoder,
+                   sim_threshold=EVENT_CLUSTER_SIM, day_window=EVENT_CLUSTER_DAYS):
+    """
+    Group signals that describe the SAME underlying event, so it votes once rather than
+    once per outlet/article. Two signals join the same event when their event_summaries
+    are similar (cosine >= sim_threshold) AND they are dated within day_window days (or a
+    date is missing). Union-find over those links -> connected components = events. This
+    catches both reworded duplicates from many outlets and the same event split across
+    Business and Financial Risk. Returns a list of clusters (each a list of signals).
+    """
+    n = len(signals)
+    if n <= 1:
+        return [[s] for s in signals]
+
+    texts = [s.get("event_summary") or s.get("headline", "") for s in signals]
+    vecs  = encoder.encode(texts, convert_to_tensor=True)
+
+    dts = []
+    for s in signals:
+        try:
+            dts.append(datetime.datetime.strptime(s.get("date", ""), "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            dts.append(None)
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if util.cos_sim(vecs[i], vecs[j]).item() < sim_threshold:
+                continue
+            close = (dts[i] is None or dts[j] is None
+                     or abs((dts[i] - dts[j]).days) <= day_window)
+            if close:
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(signals[i])
+    return list(groups.values())
+
+
+def reconcile_events(clusters):
+    """
+    Collapse each event cluster to ONE reconciled signal:
+      - direction  : sign of the confidence-weighted net of member directions -- a
+                     positive+negative split on the SAME event cancels instead of being
+                     double-counted (the RBLX / UPS one-event-two-reads problem).
+      - confidence : |net signed confidence| / members. Unanimity is preserved (a 2x +0.8
+                     cluster stays 0.8); internal disagreement shrinks it toward 0.
+      - coverage   : number of members -> feeds a mild coverage weight in scoring.
+      - key_figures: union of all members' verified figures (no evidence lost on collapse).
+      - conflicted : True if members disagreed on direction (surfaced in the report).
+    Representative display fields (event_summary, headline, url, date, sp_factor,
+    risk_category) come from the highest-confidence member on the winning side. Every
+    member is retained under "members" for the JSON audit trail.
+    """
+    sign_of = {"negative": -1, "positive": 1, "neutral": 0}
+    events  = []
+    for members in clusters:
+        net = conf_sum = 0.0
+        dirs = set()
+        for s in members:
+            sgn = sign_of.get(s.get("direction", "neutral"), 0)
+            c   = float(s.get("confidence", 0) or 0)
+            net += sgn * c
+            conf_sum += c
+            if sgn != 0:
+                dirs.add(sgn)
+
+        if net > 1e-9:
+            direction = "positive"
+        elif net < -1e-9:
+            direction = "negative"
+        else:
+            direction = "neutral"
+
+        m        = len(members)
+        rep_conf = round(abs(net) / m, 3) if m else 0.0
+
+        want = sign_of.get(direction, 0)
+        pool = [s for s in members if sign_of.get(s.get("direction"), 0) == want] or members
+        rep  = max(pool, key=lambda s: float(s.get("confidence", 0) or 0))
+
+        merged_figs, seen = [], set()
+        for s in members:
+            for f in (s.get("key_figures") or []):
+                k = f"{f.get('metric', '')}:{f.get('value', '')}".lower()
+                if k not in seen:
+                    seen.add(k)
+                    merged_figs.append(f)
+
+        ev = dict(rep)
+        ev["direction"]   = direction
+        ev["confidence"]  = rep_conf
+        ev["coverage"]    = m
+        ev["conflicted"]  = len(dirs) > 1
+        ev["key_figures"] = merged_figs
+        ev["members"]     = [
+            {"date": s.get("date"), "direction": s.get("direction"),
+             "confidence": s.get("confidence"), "risk_category": s.get("risk_category"),
+             "event_summary": s.get("event_summary"), "headline": s.get("headline"),
+             "url": s.get("url")}
+            for s in members
+        ]
+        events.append(ev)
+    return events
+
+
 # ==========================================
 # CONSOLE REPORT
 # ==========================================
+
+def _wrap_field(label, text, width=78, indent=14):
+    """Format a labelled field with word-wrapping so long text is never truncated."""
+    body = textwrap.fill(
+        text or "", width=width,
+        initial_indent="", subsequent_indent=" " * indent,
+    )
+    return f"  {label:<10}: {body}"
+
+
+# Equity/market chatter vs business/credit-fundamental news. Deterministic keyword
+# scoring -- transparent, tunable, and free (no LLM). Used only to organise the digest;
+# it never touches the credit score.
+_EQUITY_MARKERS = (
+    "stock", "shares", "share price", "price target", "price prediction", "still a buy",
+    "is a buy", "is it a buy", "better buy", "should you buy", "buy right now",
+    "buy or sell", "time to sell", "sell-off", "selloff", "overweight", "underweight",
+    "outperform", "buy rating", "hold rating", "top pick", "top-ranked", "momentum",
+    "zacks", "valuation", "premium", "stock split", "fomo", "bull case", "bear case",
+    "upside", "downside", "fair value", "forecast", "prediction:", "which stock", "vs.",
+    "rally", "rallies", "plunge", "plunges", "slump", "slides", "sinks", "surges", "soar",
+    "rebound", "rebounds", "falling", "drops", "swoon", "tumble", "dow jones", "s&p 500",
+    "nasdaq", "futures", "jobs report", "stocks that", "most-searched", "top-searched",
+    "crash", "52-week", "market cap gain",
+)
+_BUSINESS_MARKERS = (
+    "supply agreement", "supply deal", "chip supply", "take-or-pay", "contract", "signs",
+    "signed", "agreement with", "partnership", "acquire", "acquisition", "merger", "capex",
+    "capital expenditure", "billion bet", "million bet", "spending", "to spend", "invests",
+    "investment", "facility", "fab", "factory", "plant", "production", "manufacturing",
+    "debt", "leverage", "refinanc", "bond", "credit rating", "downgrade", "upgrade",
+    "outlook", "default", "bankruptcy", "dividend", "lawsuit", "settlement", "ftc",
+    "antitrust", "regulator", "probe", "recall", "revenue", "margin", "guidance",
+    "earnings", "layoff", "job cuts", "restructur", "emissions", "milestone",
+)
+
+
+def classify_news_topic(text):
+    """Return 'equity' or 'business'. 'equity' = stock-price / valuation / analyst-rating /
+    market-roundup chatter (secondary); 'business' = credit-relevant fundamentals
+    (contracts, capex, M&A, debt, legal, results, ops). Mixed/tie headlines lean 'equity'
+    so the primary digest stays clean -- equity items are still kept, just bucketed."""
+    t  = (text or "").lower()
+    eq = sum(1 for m in _EQUITY_MARKERS if m in t)
+    bz = sum(1 for m in _BUSINESS_MARKERS if m in t)
+    return "equity" if (eq > 0 and eq >= bz) else "business"
+
+
+def build_news_digest(articles):
+    """Lightweight 'what's happening' list from the on-topic articles (no LLM cost).
+    Every article the issuer was named in, newest first, whether or not it is
+    credit-material -- so a run always shows company news even at 0 scored signals.
+    Each item is tagged topic = business|equity (see classify_news_topic)."""
+    digest = []
+    for a in articles:
+        try:
+            d = datetime.datetime.fromtimestamp(a.get("datetime", 0)).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            d = ""
+        headline = a.get("headline", "")
+        summary  = (a.get("summary", "") or "")
+        digest.append({
+            "date":     d,
+            "headline": headline,
+            "summary":  summary,
+            "url":      a.get("url", ""),
+            "topic":    classify_news_topic(f"{headline} {summary}"),
+        })
+    digest.sort(key=lambda x: x["date"], reverse=True)
+    return digest
+
+
+def _clean_text(s):
+    """Drop zero-width / control chars that break non-UTF8 consoles; keep accents."""
+    return "".join(c for c in (s or "").replace("\n", " ") if c.isprintable())
+
+
+def _short_summary(text, width=110):
+    """First sentence of the Finnhub summary, capped to one short line."""
+    t = _clean_text(text).strip()
+    if not t:
+        return ""
+    first = re.split(r"(?<=[.!?])\s", t, maxsplit=1)[0]
+    if len(first) > width:
+        first = first[:width].rsplit(" ", 1)[0] + "..."
+    return first
+
+
+def cluster_top_news(items, encoder, k):
+    """Group same-story items (many outlets, one event) by headline similarity and return
+    the k biggest clusters -- coverage = importance. Each result is (representative, count);
+    representative = most recent member (items are newest-first). No LLM."""
+    if not items:
+        return []
+    vecs     = encoder.encode([it["headline"] for it in items], convert_to_tensor=True)
+    assigned = [False] * len(items)
+    clusters = []
+    for i in range(len(items)):
+        if assigned[i]:
+            continue
+        assigned[i] = True
+        members = [i]
+        for j in range(i + 1, len(items)):
+            if not assigned[j] and util.cos_sim(vecs[i], vecs[j]).item() >= DIGEST_CLUSTER_SIM:
+                assigned[j] = True
+                members.append(j)
+        clusters.append((items[min(members)], len(members)))  # rep = newest in cluster
+    clusters.sort(key=lambda c: (c[1], c[0]["date"]), reverse=True)
+    return clusters[:k]
+
+
+def _print_digest_block(clusters):
+    for rep, cnt in clusters:
+        tag = f"  ({cnt} outlets)" if cnt > 1 else ""
+        print(f"  {rep['date']}{tag}")
+        for line in textwrap.wrap(_clean_text(rep["headline"]), width=78,
+                                  initial_indent="    ", subsequent_indent="    "):
+            print(line)
+        summ = _clean_text(rep.get("summary", "")).strip()
+        if summ:
+            for line in textwrap.wrap(summ, width=78, initial_indent="      ",
+                                      subsequent_indent="      "):
+                print(line)
+        if rep.get("url"):
+            print(f"      {rep['url']}")   # raw + full so it copy-pastes intact
+
+
+def print_news_digest(digest, encoder, show_equity=True):
+    """SECONDARY section only: top equity/market stories by coverage, each with a short
+    summary. Credit-relevant news is the primary BR/FR signal report above, not repeated."""
+    equity = [d for d in digest if d.get("topic") == "equity"]
+    if not show_equity:
+        if equity:
+            print(f"\n  (equity/market news hidden -- SHOW_EQUITY_NEWS=False; {len(equity)} in JSON)")
+        return
+    top_eq = cluster_top_news(equity, encoder, DIGEST_TOP_EQUITY)
+    if not top_eq:
+        return
+    print("\n" + "=" * 65)
+    print("  SECONDARY -- TOP EQUITY / MARKET NEWS  (not credit-scored)")
+    print("=" * 65)
+    _print_digest_block(top_eq)
+
 
 def print_report(signals, ticker, company_name, sector_name):
     print("\n" + "=" * 65)
@@ -746,20 +1445,24 @@ def print_report(signals, ticker, company_name, sector_name):
                     f"  |  FinBERT: {tone}"
                     + (f" (DIVERGENT)" if align == "divergent" else "")
                 ) if tone else ""
-                print(f"\n  [{i}]  {sig['date']}  |  Credit: {arrow}"
-                      f"  |  Confidence: {sig['confidence']}{tone_str}")
-                print(f"  Event     : {sig.get('event_summary', '')[:300]}")
-                print(f"  S&P factor: {sig.get('sp_factor', '')[:120]}")
-                print(f"  Why       : {sig.get('rationale', '')[:300]}")
-                print(f"  Headline  : {sig.get('headline', '')[:120]}")
+                cov     = sig.get("coverage", 1) or 1
+                cov_str = f"  |  {cov} outlets" if cov > 1 else ""
+                confl   = "  ! reconciled from mixed reads" if sig.get("conflicted") else ""
+                print(f"\n  [{sig.get('ref', i)}]  {sig['date']}  |  Credit: {arrow}"
+                      f"  |  Confidence: {sig['confidence']}{cov_str}{tone_str}{confl}")
+                print(_wrap_field("Event", sig.get("event_summary", "")))
+                print(_wrap_field("S&P factor", sig.get("sp_factor", "")))
+                print(_wrap_field("Why", sig.get("rationale", "")))
+                print(_wrap_field("Headline", sig.get("headline", "")))
             else:                   # legacy cosine mode
                 print(f"\n  [{i}]  {sig['date']}  |  Score: {sig['similarity_score']}"
                       f"  |  Gap: {sig['confidence_gap']}")
-                print(f"  Headline  : {sig['headline'][:90]}")
-                print(f"  Criterion : {sig['matched_criterion'][:110]}...")
-                print(f"  Extract   : {sig['extracted_chunk'][:220]}...")
+                print(_wrap_field("Headline", sig.get("headline", "")))
+                print(_wrap_field("Criterion", sig.get("matched_criterion", "")))
+                print(_wrap_field("Extract", sig.get("extracted_chunk", "")))
             if sig.get("url"):
-                print(f"  Source    : {sig['url'][:90]}")
+                # printed raw + full (never wrapped) so it copy-pastes into a browser intact
+                print(f"  Source    : {sig['url']}")
     print()
 
 
@@ -783,8 +1486,9 @@ def compute_credit_score(signals, end_date_str):
                    Events closer to the evaluation date matter more.
     direction_sign: negative = -1, positive = +1, neutral = 0
 
-    Final score is normalized by the theoretical maximum (all signals pointing same way)
-    so results are always in [-1, +1] regardless of signal count.
+    Final score is normalized by the theoretical maximum (all signals pointing same way),
+    then shrunk by n/(n+SCORE_SHRINKAGE_K) so thin evidence cannot pin the ceiling.
+    Both raw and shrunk scores are returned; the verdict is read off the shrunk score.
     """
     direction_map = {"negative": -1, "positive": +1, "neutral": 0}
     risk_weights  = {"Financial Risk": 1.5, "Business Risk": 1.0}
@@ -811,7 +1515,13 @@ def compute_credit_score(signals, end_date_str):
             days_back = 45
         rec_wt = 1.0 if days_back <= 30 else (0.8 if days_back <= 60 else 0.6)
 
-        w = conf * r_wt * rec_wt
+        # Coverage weight: a widely-covered event counts more, but only mildly (log-scaled
+        # + capped) so it can't dominate. coverage defaults to 1 for legacy/unclustered.
+        cov    = int(sig.get("coverage", 1) or 1)
+        cov_wt = (min(COVERAGE_WEIGHT_MAX, 1.0 + COVERAGE_WEIGHT_K * math.log(cov))
+                  if cov > 1 else 1.0)
+
+        w = conf * r_wt * rec_wt * cov_wt
         raw_total += d_sign * w
         max_total += w
 
@@ -824,9 +1534,15 @@ def compute_credit_score(signals, end_date_str):
         elif d_sign > 0: pos_count += 1
         else:            neu_count += 1
 
-    score    = round(raw_total / max_total, 3) if max_total > 0 else 0.0
-    br_score = round(br_raw / br_max, 3)       if br_max    > 0 else None
-    fr_score = round(fr_raw / fr_max, 3)       if fr_max    > 0 else None
+    raw_score = round(raw_total / max_total, 3) if max_total > 0 else 0.0
+    br_score  = round(br_raw / br_max, 3)       if br_max    > 0 else None
+    fr_score  = round(fr_raw / fr_max, 3)       if fr_max    > 0 else None
+
+    # Evidence shrinkage: raw x n/(n+K). A unanimous 2-signal run no longer pins the
+    # ±1.0 ceiling; the score now reflects both direction AND how much evidence backs it.
+    total_signals = neg_count + pos_count + neu_count
+    evidence = (total_signals / (total_signals + SCORE_SHRINKAGE_K)) if total_signals else 0.0
+    score    = round(raw_score * evidence, 3)
 
     verdict = SCORE_BANDS[-1][2]
     description = SCORE_BANDS[-1][3]
@@ -836,7 +1552,6 @@ def compute_credit_score(signals, end_date_str):
             description = desc
             break
 
-    total_signals = neg_count + pos_count + neu_count
     if total_signals >= 8:
         conviction = "HIGH"
     elif total_signals >= 4:
@@ -846,6 +1561,8 @@ def compute_credit_score(signals, end_date_str):
 
     return {
         "score":                score,
+        "score_raw":            raw_score,
+        "evidence_factor":      round(evidence, 3),
         "verdict":              verdict,
         "description":          description,
         "conviction":           conviction,
@@ -854,6 +1571,447 @@ def compute_credit_score(signals, end_date_str):
         "negative_signals":     neg_count,
         "positive_signals":     pos_count,
         "neutral_signals":      neu_count,
+    }
+
+
+def bootstrap_score_band(signals, end_date_str,
+                         n_resamples=BOOTSTRAP_RESAMPLES, seed=BOOTSTRAP_SEED):
+    """
+    Nonparametric bootstrap over the signal set to quantify how much the credit
+    score depends on WHICH signals happened to appear -- i.e. how strongly the
+    evidence agrees. This is an internal-agreement measure, NOT a probability of a
+    rating action and NOT a statement about correctness (garbage in -> garbage out).
+
+    Resamples the signals with replacement n_resamples times, recomputes the
+    aggregate score on each resample (reusing compute_credit_score so the formula
+    stays single-sourced), and returns:
+      - median          : central estimate across resamples
+      - band_90         : [5th, 95th] percentile band; tight = agreement, wide = fragile
+      - verdict_stability: share of resamples landing in each SCORE_BANDS verdict
+
+    Operates only on the signals passed in (already restricted to the user's date
+    window) and dates them against end_date_str -- no external data, nothing to
+    hallucinate. Returns None when there are too few signals for a meaningful band.
+    """
+    n = len(signals)
+    if n < MIN_BOOTSTRAP_SIGNALS:
+        return None
+
+    rng    = random.Random(seed)
+    scores = []
+    for _ in range(n_resamples):
+        sample = [signals[rng.randrange(n)] for _ in range(n)]
+        scores.append(compute_credit_score(sample, end_date_str)["score"])
+
+    scores.sort()
+
+    def _pct(p):
+        idx = min(len(scores) - 1, max(0, int(round(p * (len(scores) - 1)))))
+        return round(scores[idx], 3)
+
+    band_counts = {}
+    for sc in scores:
+        for lo, hi, label, _ in SCORE_BANDS:
+            if lo <= sc <= hi:
+                band_counts[label] = band_counts.get(label, 0) + 1
+                break
+    verdict_stability = {k: round(v / len(scores), 3) for k, v in band_counts.items()}
+
+    return {
+        "median":            _pct(0.5),
+        "band_90":           [_pct(0.05), _pct(0.95)],
+        "n_resamples":       n_resamples,
+        "verdict_stability": verdict_stability,
+    }
+
+
+# ==========================================
+# MARKET & COMPANY CONTEXT
+# ==========================================
+
+def _fmt_money(x):
+    if not x:
+        return "n/a"
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"${x / 1e9:.1f}B" if abs(x) >= 1e9 else f"${x / 1e6:.0f}M"
+
+
+def _cell(df, row, col):
+    """Safely read df.loc[row, col] as a float; return None if missing/NaN."""
+    try:
+        v = float(df.loc[row, col])
+        return None if v != v else v  # NaN check
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fin_summary(fin):
+    rev_period = f" ({fin['revenue_period']})" if fin.get("revenue_period") else ""
+    mcap = fin.get("market_cap") or fin.get("market_cap_fallback")
+    return (f"total debt {_fmt_money(fin.get('total_debt'))}, "
+            f"revenue {_fmt_money(fin.get('total_revenue'))}{rev_period}, "
+            f"market cap {_fmt_money(mcap)}")
+
+
+def fetch_company_financials(ticker, as_of_date, info=None,
+                             lag_days=FINANCIALS_REPORTING_LAG_DAYS):
+    """
+    POINT-IN-TIME size snapshot as of as_of_date, from free yfinance quarterly
+    statements. Picks the most recent quarter whose period-end is on/before
+    (as_of_date - lag_days), so a backtest never uses figures that were probably not
+    public yet. Balance-sheet debt is taken from that quarter; revenue is that
+    quarter's figure (period-labelled); market cap is filled later from
+    price(end) x shares. Falls back to the latest .info snapshot when quarterly
+    history does not reach the window. Best-effort -- never raises.
+    """
+    fin = {"total_debt": None, "total_revenue": None, "revenue_period": None,
+           "market_cap": None, "market_cap_fallback": None, "shares_outstanding": None,
+           "as_of": None, "basis": "latest snapshot", "source": "Yahoo Finance"}
+    tk = None
+    try:
+        tk = yf.Ticker(yf_symbol(ticker))
+        if info is None:
+            info = tk.info
+    except Exception:  # noqa: BLE001
+        info = info or {}
+    fin["shares_outstanding"]  = info.get("sharesOutstanding")
+    fin["market_cap_fallback"] = info.get("marketCap")
+
+    try:
+        cutoff = (datetime.datetime.strptime(as_of_date, "%Y-%m-%d")
+                  - datetime.timedelta(days=lag_days)).date()
+    except (ValueError, TypeError):
+        cutoff = None
+
+    picked = None
+    if tk is not None and cutoff is not None:
+        try:
+            bs = tk.quarterly_balance_sheet
+            eligible = sorted(c for c in bs.columns if c.to_pydatetime().date() <= cutoff)
+            if eligible:
+                picked = eligible[-1]
+                fin["total_debt"] = _cell(bs, "Total Debt", picked)
+                fin["as_of"]      = picked.strftime("%Y-%m-%d")
+                fin["basis"]      = "quarterly (point-in-time)"
+                fin["source"]     = "Yahoo Finance (quarterly statements)"
+        except Exception:  # noqa: BLE001
+            picked = None
+    if picked is not None:
+        try:
+            isq = tk.quarterly_income_stmt
+            elig = sorted(c for c in isq.columns if c.to_pydatetime().date() <= cutoff)
+            if elig:
+                pcol = elig[-1]
+                fin["total_revenue"]  = _cell(isq, "Total Revenue", pcol)
+                fin["revenue_period"] = "qtr ending " + pcol.strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fallback: latest snapshot when quarterly history doesn't reach the window.
+    if fin["total_debt"] is None and fin["total_revenue"] is None:
+        fin["total_debt"]    = info.get("totalDebt")
+        fin["total_revenue"] = info.get("totalRevenue")
+        fin["basis"]         = "latest snapshot (quarterly history unavailable)"
+        fin["source"]        = "Yahoo Finance"
+        mrq = info.get("mostRecentQuarter")
+        if mrq:
+            try:
+                fin["as_of"] = datetime.datetime.fromtimestamp(mrq).strftime("%Y-%m-%d")
+            except Exception:  # noqa: BLE001
+                pass
+
+    fin["summary"] = _fin_summary(fin)
+    return fin
+
+
+def compute_filings_fr_signal(ticker, as_of_date, lag_days=FINANCIALS_REPORTING_LAG_DAYS):
+    """
+    Deterministic Financial Risk signal from quarterly filings -- no news, no LLM. Measures
+    the net-debt (and, when EBITDA is available, net-leverage) trend across the quarters
+    on/before as_of_date. Rising net debt = credit-negative; a decline = credit-positive.
+    This complements the news channel and catches quiet balance-sheet moves that never make
+    headlines (the ADEA deleveraging / WBD zero-news blind spots); it also fires when the
+    news channel returns nothing. Returns a signal dict in the standard schema, or None when
+    the trend is immaterial or the data is insufficient. Best-effort; never raises.
+    """
+    try:
+        tk  = yf.Ticker(yf_symbol(ticker))
+        bs  = tk.quarterly_balance_sheet
+        isq = tk.quarterly_income_stmt
+    except Exception:  # noqa: BLE001
+        return None
+    if bs is None or getattr(bs, "empty", True):
+        return None
+    try:
+        cutoff = (datetime.datetime.strptime(as_of_date, "%Y-%m-%d")
+                  - datetime.timedelta(days=lag_days)).date()
+    except (ValueError, TypeError):
+        return None
+
+    cols = sorted(c for c in bs.columns if c.to_pydatetime().date() <= cutoff)[-5:]
+    if len(cols) < 2:
+        return None
+
+    net_debt = []
+    for c in cols:
+        debt = _cell(bs, "Total Debt", c)
+        cash = (_cell(bs, "Cash And Cash Equivalents", c)
+                or _cell(bs, "Cash Cash Equivalents And Short Term Investments", c))
+        net_debt.append(None if debt is None else debt - (cash or 0))
+
+    pts = [(c, v) for c, v in zip(cols, net_debt) if v is not None]
+    if len(pts) < 2 or abs(pts[0][1]) < 1e-6:
+        return None
+
+    (_c_then, nd_then), (c_now, nd_now) = pts[0], pts[-1]
+    # Net-cash companies (net debt <= 0) have no leverage pressure -- a "rising net debt"
+    # on a negative base is meaningless and must not produce a credit-negative signal
+    # (e.g. Nvidia: net debt -$889M = net cash, was wrongly flagged DOWNGRADE WATCH).
+    if nd_now <= 0:
+        return None
+    pct = (nd_now - nd_then) / abs(nd_then)
+    if -FILINGS_FR_MIN_CHANGE < pct < FILINGS_FR_MIN_CHANGE:
+        return None  # immaterial trend -> stay silent rather than add noise
+    direction = "negative" if pct > 0 else "positive"
+    if FILINGS_FR_NEGATIVE_ONLY and direction == "positive":
+        return None  # deleveraging is weak/unreliable credit-positive evidence -> stay silent
+
+    # Net-leverage context (TTM EBITDA), best-effort across differing yfinance labels.
+    leverage = None
+    try:
+        if isq is not None and not isq.empty:
+            icols = sorted(c for c in isq.columns if c.to_pydatetime().date() <= cutoff)[-4:]
+            ebitda = []
+            for c in icols:
+                e = (_cell(isq, "EBITDA", c) or _cell(isq, "Normalized EBITDA", c)
+                     or _cell(isq, "EBIT", c) or _cell(isq, "Operating Income", c))
+                if e is not None:
+                    ebitda.append(e)
+            ttm = sum(ebitda) if ebitda else None
+            if ttm and ttm > 0:
+                leverage = nd_now / ttm
+    except Exception:  # noqa: BLE001
+        leverage = None
+
+    # Sanity guards -- for institutional use, no signal beats a wrong signal:
+    #  (a) implausible leverage => EBITDA data is patchy; drop the x-figure, keep direction.
+    if leverage is not None and (leverage < 0 or leverage > 25):
+        leverage = None
+    #  (b) a near-zero base quarter makes the % explode and meaningless; only trust it when
+    #      a plausible leverage level corroborates the move, else stay silent.
+    if abs(nd_then) < 0.10 * abs(nd_now) and leverage is None:
+        return None
+
+    conf    = round(min(FILINGS_FR_MAX_CONF, 0.65 + min(0.25, abs(pct))), 3)
+    verb    = "rose" if pct > 0 else "fell"
+    lev_str = f"; net leverage {leverage:.1f}x" if leverage is not None else ""
+    figs    = [{"metric": "net debt", "value": _fmt_money(nd_now)}]
+    if leverage is not None:
+        figs.append({"metric": "net leverage", "value": f"{leverage:.1f}x"})
+
+    return {
+        "date":          c_now.strftime("%Y-%m-%d"),
+        "direction":     direction,
+        "confidence":    conf,
+        "risk_category": "Financial Risk",
+        "sp_factor":     "Leverage trend (quarterly filings)",
+        "event_summary": (f"Net debt {verb} {abs(pct) * 100:.0f}% to {_fmt_money(nd_now)} "
+                          f"over {len(pts)} quarters (through {c_now.strftime('%Y-%m-%d')}, "
+                          f"filings){lev_str}"),
+        "rationale":     ("Rising net leverage pressures debt service and coverage"
+                          if direction == "negative"
+                          else "Deleveraging improves interest coverage and financial flexibility"),
+        "headline":      "Quarterly filings (Yahoo Finance)",
+        "url":           "",
+        "key_figures":   figs,
+        "coverage":      1,
+        "source":        "filings",
+    }
+
+
+def compute_financial_panel(ticker, as_of_date, lag_days=FINANCIALS_REPORTING_LAG_DAYS,
+                            n_quarters=FINANCIAL_PANEL_QUARTERS):
+    """
+    Always-on quarterly fundamentals panel from yfinance statements (no news, no LLM):
+    revenue, net income, gross/EBITDA/net margins, free cash flow, total debt and net debt
+    across the last n_quarters on/before as_of_date, each with a simple trend. Purely
+    descriptive context for the analyst -- the scored FR signal is computed separately.
+    Best-effort; returns None if statements are unavailable.
+    """
+    try:
+        tk  = yf.Ticker(yf_symbol(ticker))
+        isq = tk.quarterly_income_stmt
+        bs  = tk.quarterly_balance_sheet
+        cf  = tk.quarterly_cashflow
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        cutoff = (datetime.datetime.strptime(as_of_date, "%Y-%m-%d")
+                  - datetime.timedelta(days=lag_days)).date()
+    except (ValueError, TypeError):
+        return None
+
+    if isq is None or getattr(isq, "empty", True):
+        return None
+    cols = sorted(c for c in isq.columns if c.to_pydatetime().date() <= cutoff)[-n_quarters:]
+    if not cols:
+        return None
+
+    def series(df, *labels):
+        vals = []
+        for c in cols:
+            v = None
+            if df is not None and not getattr(df, "empty", True) and c in df.columns:
+                for lab in labels:
+                    v = _cell(df, lab, c)
+                    if v is not None:
+                        break
+            vals.append(v)
+        return vals
+
+    revenue = series(isq, "Total Revenue")
+    net_inc = series(isq, "Net Income", "Net Income Common Stockholders")
+    gross   = series(isq, "Gross Profit")
+    ebitda  = series(isq, "EBITDA", "Normalized EBITDA")
+    ebit    = series(isq, "EBIT", "Operating Income")
+    op_cf   = series(cf,  "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+    capex   = series(cf,  "Capital Expenditure")
+    fcf_dir = series(cf,  "Free Cash Flow")
+    debt    = series(bs,  "Total Debt")
+    cash    = series(bs,  "Cash And Cash Equivalents",
+                          "Cash Cash Equivalents And Short Term Investments")
+
+    ebitda   = [ebitda[i] if ebitda[i] is not None else ebit[i] for i in range(len(cols))]
+    net_debt = [debt[i] - (cash[i] or 0) if debt[i] is not None else None
+                for i in range(len(cols))]
+
+    def fcf_at(i):
+        if fcf_dir[i] is not None:
+            return fcf_dir[i]
+        if op_cf[i] is not None:
+            return op_cf[i] - (abs(capex[i]) if capex[i] is not None else 0)
+        return None
+    fcf = [fcf_at(i) for i in range(len(cols))]
+
+    def margin(num, den):
+        return [(100.0 * n / d if (n is not None and d not in (None, 0)) else None)
+                for n, d in zip(num, den)]
+
+    metrics = [
+        {"name": "Revenue",        "unit": "money", "values": revenue},
+        {"name": "Net income",     "unit": "money", "values": net_inc},
+        {"name": "Gross margin",   "unit": "pct",   "values": margin(gross, revenue)},
+        {"name": "EBITDA",         "unit": "money", "values": ebitda},
+        {"name": "EBITDA margin",  "unit": "pct",   "values": margin(ebitda, revenue)},
+        {"name": "Net margin",     "unit": "pct",   "values": margin(net_inc, revenue)},
+        {"name": "Free cash flow", "unit": "money", "values": fcf},
+        {"name": "Total debt",     "unit": "money", "values": debt},
+        {"name": "Net debt",       "unit": "money", "values": net_debt},
+    ]
+    for m in metrics:
+        nn = [v for v in m["values"] if v is not None]
+        if len(nn) >= 2 and nn[0] != 0:
+            chg = (nn[-1] - nn[0]) / abs(nn[0])
+            m["trend"] = "up" if chg > 0.02 else ("down" if chg < -0.02 else "flat")
+            m["change_pct"] = round(chg * 100, 1)
+        else:
+            m["trend"] = ""
+            m["change_pct"] = None
+
+    return {"as_of": as_of_date, "source": "Yahoo Finance (quarterly statements)",
+            "quarters": [c.strftime("%Y-%m-%d") for c in cols], "metrics": metrics}
+
+
+def print_financial_panel(panel, ticker, company_name):
+    """Render the quarterly fundamentals panel as a compact metric x quarter table."""
+    if not panel:
+        return
+    qs = panel["quarters"]
+    print("\n" + "=" * 65)
+    print(f"  FINANCIAL HEALTH (quarterly filings)  -  {company_name} ({ticker})")
+    print("=" * 65)
+    print(f"  {'Metric':<15}" + "".join(f"{q:>13}" for q in qs) + f"{'trend':>12}")
+    for m in panel["metrics"]:
+        cells = []
+        for v in m["values"]:
+            if v is None:
+                cells.append("n/a")
+            elif m["unit"] == "money":
+                cells.append(_fmt_money(v))
+            else:
+                cells.append(f"{v:.1f}%")
+        chg = m.get("change_pct")
+        tr  = m.get("trend", "")
+        trend_str = f"{tr} {chg:+.0f}%" if (tr and chg is not None) else (tr or "")
+        print(f"  {m['name']:<15}" + "".join(f"{c:>13}" for c in cells) + f"{trend_str:>12}")
+    print(f"\n  (source: {panel.get('source')}; oldest -> newest quarter; trend = first vs last)")
+    print("=" * 65)
+
+
+def compute_market_context(signals, ticker, start_date, end_date, benchmark=MARKET_BENCHMARK):
+    """
+    Summary-level market snapshot AS OF end_date, using only real yfinance closes
+    inside [start_date, end_date] -- no prices fetched outside the window, nothing
+    synthesised. Returns:
+      - last_close on/before end_date
+      - stock vs benchmark cumulative return over the window (abnormal = stock - bench)
+      - chart-ready series (dates, stock_close, benchmark rebased) + signal markers
+        (date, direction) for the dashboard.
+    This is an EQUITY reaction proxy, not bond repricing. Does NOT annotate individual
+    signals. Returns None if price data is unavailable.
+    """
+    try:
+        end_excl = (datetime.datetime.strptime(end_date, "%Y-%m-%d")
+                    + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        end_excl = end_date
+    try:
+        stk = yf.Ticker(yf_symbol(ticker)).history(start=start_date, end=end_excl, auto_adjust=True)
+        bmk = yf.Ticker(benchmark).history(start=start_date, end=end_excl, auto_adjust=True)
+        if stk.empty or bmk.empty:
+            print("    [market snapshot skipped] no price data in window")
+            return None
+    except Exception as exc:  # noqa: BLE001
+        print(f"    [market snapshot skipped] {str(exc).splitlines()[0][:120]}")
+        return None
+
+    dates     = [d.strftime("%Y-%m-%d") for d in stk.index]
+    stk_close = [float(c) for c in stk["Close"].tolist()]
+    bmk_map   = {d.strftime("%Y-%m-%d"): float(c) for d, c in zip(bmk.index, bmk["Close"])}
+    bmk_close = [bmk_map.get(d) for d in dates]
+
+    last_close = stk_close[-1] if stk_close else None
+    stock_ret  = ((stk_close[-1] / stk_close[0] - 1) * 100
+                  if len(stk_close) >= 2 and stk_close[0] else None)
+    b_first = next((c for c in bmk_close if c), None)
+    b_last  = next((c for c in reversed(bmk_close) if c), None)
+    bench_ret = (b_last / b_first - 1) * 100 if (b_first and b_last) else None
+    abnormal  = (round(stock_ret - bench_ret, 2)
+                 if (stock_ret is not None and bench_ret is not None) else None)
+
+    base_s = next((c for c in stk_close if c), None)
+    norm_b = [round(c / b_first * base_s, 4) if (c and b_first and base_s) else None
+              for c in bmk_close]
+    markers = [{"date": s.get("date"), "direction": s.get("direction")} for s in signals]
+
+    return {
+        "ticker":                     ticker,
+        "benchmark":                  benchmark,
+        "source":                     "Yahoo Finance",
+        "as_of":                      end_date,
+        "window_start":               dates[0] if dates else start_date,
+        "window_end":                 dates[-1] if dates else end_date,
+        "last_close":                 round(last_close, 2) if last_close else None,
+        "stock_return_pct":           round(stock_ret, 2) if stock_ret is not None else None,
+        "benchmark_return_pct":       round(bench_ret, 2) if bench_ret is not None else None,
+        "abnormal_return_pct":        abnormal,
+        "dates":                      dates,
+        "stock_close":                stk_close,
+        "benchmark_close_normalized": norm_b,
+        "signal_markers":             markers,
     }
 
 
@@ -872,6 +2030,13 @@ def print_score_summary(result, ticker, company_name):
     print(f"  {company_name} ({ticker})")
     print("=" * 65)
     print(f"\n  Overall score  : {score:+.3f}   [{verdict}]")
+    raw = result.get("score_raw")
+    ev  = result.get("evidence_factor")
+    if raw is not None and ev is not None and ev < 1.0:
+        n = (result.get("negative_signals", 0) + result.get("positive_signals", 0)
+             + result.get("neutral_signals", 0))
+        print(f"                   (raw {raw:+.3f} x evidence factor {ev:.2f} at n={n} "
+              f"-- thin evidence is pulled toward 0)")
     print(f"  Interpretation : {result.get('description', '')}")
     print(f"  [-1.0 NEGATIVE |{bar}| POSITIVE +1.0]")
 
@@ -885,10 +2050,96 @@ def print_score_summary(result, ticker, company_name):
           f"{result['positive_signals']} positive  |  "
           f"{result['neutral_signals']} neutral")
     print(f"  Conviction     : {conviction}  ({conv_note})")
+
+    stability = result.get("stability")
+    if stability:
+        lo, hi = stability["band_90"]
+        order  = [b[2] for b in SCORE_BANDS]  # most-negative -> most-positive
+        vi     = order.index(verdict) if verdict in order else 0
+        # "verdict-or-worse" for credit = this band + all more-negative bands
+        here_or_worse = sum(
+            share for lbl, share in stability["verdict_stability"].items()
+            if lbl in order[:vi + 1]
+        )
+        print(f"\n  Uncertainty    : median {stability['median']:+.3f}   "
+              f"90% band [{lo:+.3f}, {hi:+.3f}]")
+        print(f"  Verdict stab.  : {here_or_worse * 100:.0f}% of {stability['n_resamples']} "
+              f"resamples land {verdict}-or-worse")
+        print(f"                   (signal agreement, NOT probability of a rating action)")
+    else:
+        print(f"\n  Uncertainty    : too few signals for a band "
+              f"(need >= {MIN_BOOTSTRAP_SIGNALS})")
+
     print(f"\n  Score bands :")
     for lo, hi, label, desc in SCORE_BANDS:
         marker = " <--" if verdict == label else ""
         print(f"    [{lo:+.2f} to {hi:+.2f}]  {label}{marker}")
+    print("=" * 65 + "\n")
+
+
+def print_end_date_snapshot(end_date, financials, market_ctx, agg_figures,
+                            score_result, ticker, company_name, contradictions=None):
+    """
+    Single 'as of end_date' panel: the bottom-line verdict, the price/return vs
+    benchmark over the window, the company financials, and the hard numbers cited
+    across the news -- everything aggregated here rather than repeated per signal.
+    """
+    neg = score_result.get("negative_signals", 0)
+    pos = score_result.get("positive_signals", 0)
+    neu = score_result.get("neutral_signals", 0)
+
+    print("\n" + "=" * 65)
+    print(f"  SNAPSHOT AS OF {end_date}   -   {company_name} ({ticker})")
+    print("=" * 65)
+    print(f"\n  Bottom line    : {neg} negative | {pos} positive | {neu} neutral  ->  "
+          f"{score_result.get('verdict')}  (score {score_result.get('score', 0):+.3f})")
+
+    for a, b in (contradictions or []):
+        print(f"  ! Conflict     : signals #{a} and #{b} are same-date, opposite "
+              f"directions -- likely ONE event read two ways; reconcile before acting")
+
+    if market_ctx:
+        lc = market_ctx.get("last_close")
+        sr = market_ctx.get("stock_return_pct")
+        br = market_ctx.get("benchmark_return_pct")
+        ab = market_ctx.get("abnormal_return_pct")
+        price_str = f"${lc:.2f}" if lc is not None else "n/a"
+        if sr is not None and br is not None:
+            print(f"  Price          : {price_str}   (window: {ticker} {sr:+.1f}% vs "
+                  f"{market_ctx.get('benchmark')} {br:+.1f}%, abnormal {ab:+.1f}%)")
+            net = pos - neg
+            if ab is not None and net != 0:
+                aligned = (ab < 0) if net < 0 else (ab > 0)
+                side    = "negative" if net < 0 else "positive"
+                if aligned:
+                    print(f"                   -> equity already moved with the {side} news "
+                          f"(partly reflected in price)")
+                else:
+                    print(f"                   -> equity has NOT reflected the {side} credit "
+                          f"view yet (potential lead-time edge)")
+            ws, we = market_ctx.get("window_start"), market_ctx.get("window_end")
+            print(f"                   (source: {market_ctx.get('source', 'Yahoo Finance')}, "
+                  f"{ws} -> {we}; equity reaction, NOT bond repricing)")
+        else:
+            print(f"  Price          : {price_str}")
+    else:
+        print("  Price          : market data unavailable")
+
+    if financials:
+        asof  = financials.get("as_of")
+        src   = financials.get("source", "Yahoo Finance")
+        basis = financials.get("basis", "")
+        asof_str = f", as of {asof}" if asof else ""
+        print(f"  Financials     : {financials.get('summary', 'n/a')}")
+        print(f"                   (source: {src}{asof_str}; basis: {basis})")
+
+    if agg_figures:
+        print("  Key figures    : (verified present in the cited news; #n = signal above)")
+        for f in agg_figures:
+            tag  = f"#{f['ref']}" if f.get("ref") else f.get("date", "")
+            body = textwrap.fill(f"{f['figure']}  [{tag}]",
+                                 width=60, subsequent_indent=" " * 6)
+            print(f"    - {body}")
     print("=" * 65 + "\n")
 
 
@@ -925,18 +2176,37 @@ def run_pipeline():
     except Exception:  # noqa: BLE001
         pass
 
-    global TICKER, COMPANY_NAME, START_DATE, END_DATE, JUDGE_MODEL
+    global TICKER, COMPANY_NAME, START_DATE, END_DATE, JUDGE_BACKEND, JUDGE_MODEL, SHOW_EQUITY_NEWS
 
     print("=" * 65)
     print("  CREDIT RISK EXTRACTION PIPELINE  -  Joywin International")
     print("=" * 65)
-    print("\n  Press Enter to keep the default shown in [brackets].\n")
 
-    TICKER       = _ask("Ticker symbol",  TICKER).upper()
-    COMPANY_NAME = _ask("Company name",   COMPANY_NAME)
-    START_DATE   = _ask("Start date (YYYY-MM-DD)", START_DATE)
-    END_DATE     = _ask("End date   (YYYY-MM-DD)", END_DATE)
-    _choose_judge()
+    # Non-interactive mode for batch runs / the backtest harness:
+    #   python credit_risk_pipeline.py TICKER "Company Name" START END [JUDGE_CHOICE 1-7]
+    cli = sys.argv[1:]
+    if len(cli) >= 4:
+        TICKER, COMPANY_NAME = cli[0].upper(), cli[1]
+        START_DATE, END_DATE = cli[2], cli[3]
+        try:
+            idx = int(cli[4]) - 1 if len(cli) >= 5 else 0
+        except ValueError:
+            idx = 0
+        if not 0 <= idx < len(JUDGE_CHOICES):
+            idx = 0
+        _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
+        if len(cli) >= 6 and cli[5].lower() in ("noequity", "hideequity", "0", "false", "no"):
+            SHOW_EQUITY_NEWS = False
+        print(f"\n  Non-interactive run (CLI args)")
+    else:
+        print("\n  Press Enter to keep the default shown in [brackets].\n")
+        TICKER       = _ask("Ticker symbol",  TICKER).upper()
+        COMPANY_NAME = _ask("Company name",   COMPANY_NAME)
+        START_DATE   = _ask("Start date (YYYY-MM-DD)", START_DATE)
+        END_DATE     = _ask("End date   (YYYY-MM-DD)", END_DATE)
+        _choose_judge()
+        SHOW_EQUITY_NEWS = _ask("Include equity/market news in digest? (y/n)",
+                                "y").lower().startswith("y")
 
     print()
     print(f"  Target : {COMPANY_NAME} ({TICKER})")
@@ -961,12 +2231,29 @@ def run_pipeline():
     # ── Phase 1: Routing ──────────────────────────────────────────
     print("\n[Phase 1] Data ingestion & sector routing...")
 
-    yf_ticker = yf.Ticker(TICKER)
-    industry  = yf_ticker.info.get("industry", "Unknown")
+    yf_ticker = yf.Ticker(yf_symbol(TICKER))
+    info      = yf_ticker.info
+    industry  = info.get("industry", "Unknown")
     print(f"  Yahoo Finance industry : {industry}")
 
-    target_sector = match_sp_sector(industry, sp_criteria_master)
-    print(f"  Matched S&P sector     : {target_sector['sector_name']}")
+    routed = None
+    if USE_LLM_SECTOR_ROUTING:
+        routed = match_sp_sector_llm(
+            COMPANY_NAME, industry, info.get("longBusinessSummary", ""), sp_criteria_master)
+    if routed:
+        target_sector, sector_candidates = routed
+        print(f"  Matched S&P sector     : {target_sector['sector_name']}  (LLM routing)")
+    else:
+        target_sector, sector_candidates = match_sp_sector(
+            industry, info.get("longBusinessSummary", ""), sp_criteria_master, encoder)
+        print(f"  Matched S&P sector     : {target_sector['sector_name']}  (embedding fallback)")
+        if len(sector_candidates) > 1:
+            alt = ", ".join(f"{n} ({sc})" for n, sc in sector_candidates[1:])
+            print(f"  (runner-up sectors     : {alt})")
+
+    financials = fetch_company_financials(TICKER, END_DATE, info)
+    print(f"  Financials ({financials['basis']}, as of {financials['as_of']}) : "
+          f"{financials['summary']}")
 
     criteria_labels, criteria_texts = [], []
     for kw in target_sector.get("business_risk_keywords", []):
@@ -976,12 +2263,47 @@ def run_pipeline():
         criteria_labels.append("Financial Risk")
         criteria_texts.append(kw)
 
-    finnhub_url = (
-        f"https://finnhub.io/api/v1/company-news"
-        f"?symbol={TICKER}&from={START_DATE}&to={END_DATE}&token={FINNHUB_API_KEY}"
-    )
-    news_data = requests.get(finnhub_url).json()
-    print(f"  Finnhub articles fetched : {len(news_data)}")
+    news_data = []
+    if USE_FINNHUB:
+        finnhub_url = (
+            f"https://finnhub.io/api/v1/company-news"
+            f"?symbol={TICKER}&from={START_DATE}&to={END_DATE}&token={FINNHUB_API_KEY}"
+        )
+        try:
+            resp = requests.get(finnhub_url, timeout=15).json()
+            news_data = resp if isinstance(resp, list) else []
+        except Exception:  # noqa: BLE001
+            news_data = []
+        print(f"  Finnhub articles fetched : {len(news_data)}")
+
+    if USE_GDELT:
+        gdelt = fetch_gdelt_news(COMPANY_NAME, TICKER, START_DATE, END_DATE)
+        print(f"  GDELT fetched            : {len(gdelt)}")
+        before   = len(news_data)
+        news_data = merge_news(news_data, gdelt)
+        print(f"  Merged feed (deduped)    : {len(news_data)}  (+{len(news_data) - before} net new)")
+
+    if USE_GOOGLE_NEWS:
+        gnews = fetch_google_news(COMPANY_NAME, TICKER, START_DATE, END_DATE)
+        print(f"  Google News fetched      : {len(gnews)}")
+        before   = len(news_data)
+        news_data = merge_news(news_data, gnews)
+        print(f"  Merged feed (deduped)    : {len(news_data)}  (+{len(news_data) - before} net new)")
+
+    # Entity gate: keep only articles that actually name the issuer. Finnhub tags generic
+    # market commentary and competitor stories to big tickers; those are pure downstream
+    # noise. Fall back to the full feed only if the gate removes everything (name mismatch).
+    is_about = build_entity_matcher(COMPANY_NAME, TICKER)
+    on_topic = [a for a in news_data if is_about(a)]
+    if on_topic:
+        dropped = len(news_data) - len(on_topic)
+        print(f"  On-topic (names issuer)  : {len(on_topic)}  ({dropped} off-topic dropped)")
+        news_data = on_topic
+    elif news_data:
+        print("  [entity gate matched 0 -- keeping full feed; check company name spelling]")
+
+    # "What's happening" digest: every on-topic article, whether or not it scores.
+    news_digest = build_news_digest(news_data)
 
     if MAX_ARTICLES and len(news_data) > MAX_ARTICLES:
         news_data = sorted(news_data, key=lambda a: a.get("datetime", 0),
@@ -989,11 +2311,11 @@ def run_pipeline():
         print(f"  Capped to most-recent    : {len(news_data)}")
 
     if USE_LLM_JUDGE:
-        # ── Phase 2: Cross-encoder relevance filter ───────────────
-        print(f"\n[Phase 2] Cross-encoder relevance filter ({len(news_data)} articles -> top {CROSSENCODER_TOP_N})...")
+        # ── Phase 2: Cross-encoder relevance filter (S&P criteria = the anchor) ──
+        print(f"\n[Phase 2] Cross-encoder relevance filter ({len(news_data)} on-topic -> top {CROSSENCODER_TOP_N})...")
         print("  Loading cross-encoder model...")
         filtered = filter_with_crossencoder(news_data, criteria_texts, criteria_labels)
-        print(f"  Kept : {len(filtered)} articles (highest criterion relevance)")
+        print(f"  Kept : {len(filtered)} articles (best match to S&P criteria)")
 
         # ── Phase 3: Scrape only the filtered articles ────────────
         print(f"\n[Phase 3] Scraping {len(filtered)} selected articles ({SCRAPE_WORKERS} threads)...")
@@ -1001,10 +2323,15 @@ def run_pipeline():
         def fetch(article):
             url     = article.get("url", "")
             summary = article.get("summary", "")
-            text    = scrape_full_text(url, summary) if url else summary
+            if url:
+                text, resolved = scrape_full_text(url, summary)
+            else:
+                text, resolved = summary, url
             scraped = text != summary
             article = dict(article)
             article["full_text"] = text
+            if resolved:                         # store the clickable publisher URL
+                article["url"] = resolved
             article["date"] = datetime.datetime.fromtimestamp(
                 article.get("datetime", 0)).strftime("%Y-%m-%d")
             return article, scraped
@@ -1019,7 +2346,15 @@ def run_pipeline():
 
         # ── Phase 4: Local-Claude judge (one call per article) ────
         print(f"\n[Phase 4] Judge: {JUDGE_MODEL} via {JUDGE_BACKEND} ({JUDGE_WORKERS} workers)...")
-        all_signals = run_judge_articles(fetched_articles, COMPANY_NAME, target_sector["sector_name"])
+        # Short point-in-time debt line so the judge can size Financial Risk correctly
+        # (rule in the prompt forbids restating these figures in its prose).
+        mcap = financials.get("market_cap") or financials.get("market_cap_fallback")
+        debt_ctx = ""
+        if financials.get("total_debt") is not None or mcap:
+            debt_ctx = (f"total debt {_fmt_money(financials.get('total_debt'))}, "
+                        f"market cap {_fmt_money(mcap)} (as of {financials.get('as_of')})")
+        all_signals = run_judge_articles(fetched_articles, COMPANY_NAME,
+                                         target_sector["sector_name"], debt_ctx)
         print(f"  Judged material : {len(all_signals)}")
 
         if USE_FINBERT and all_signals:
@@ -1045,7 +2380,12 @@ def run_pipeline():
         def fetch_legacy(meta):
             url     = meta.get("url", "")
             summary = meta.get("summary", "")
-            text    = scrape_full_text(url, summary) if url else summary
+            if url:
+                text, resolved = scrape_full_text(url, summary)
+                if resolved:
+                    meta = {**meta, "url": resolved}
+            else:
+                text = summary
             return meta, text
 
         with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as pool:
@@ -1107,17 +2447,90 @@ def run_pipeline():
     # ── Phase 5: Deduplication & ranking ─────────────────────────
     print("\n[Phase 5] Deduplication & ranking...")
 
-    unique_signals = deduplicate(all_signals, encoder)
-    unique_signals.sort(key=lambda x: x.get(rank_key, 0), reverse=True)
-    top_signals = unique_signals[:TOP_N_OUTPUT]
+    if USE_LLM_JUDGE:
+        # Event-level dedup: one event -> one reconciled vote, weighted by coverage.
+        clusters       = cluster_events(all_signals, encoder)
+        unique_signals = reconcile_events(clusters)
+        unique_signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        top_signals    = unique_signals[:TOP_N_OUTPUT]
+        merged         = len(all_signals) - len(unique_signals)
+        print(f"  Articles judged : {len(all_signals)}  ->  Events : {len(unique_signals)}"
+              f"  ({merged} same-event votes merged)")
+    else:
+        unique_signals = deduplicate(all_signals, encoder)
+        unique_signals.sort(key=lambda x: x.get(rank_key, 0), reverse=True)
+        top_signals    = unique_signals[:TOP_N_OUTPUT]
+        print(f"  Unique signals : {len(unique_signals)} | Reporting : {len(top_signals)}")
 
-    print(f"  Unique signals : {len(unique_signals)} | Reporting : {len(top_signals)}")
+    # ── Phase 5c: deterministic Financial-Risk signal from quarterly filings ──
+    # No news, no LLM -- fires even at zero news coverage; catches quiet leverage moves.
+    if USE_LLM_JUDGE and USE_FILINGS_FR:
+        print("\n[Phase 5c] Filings Financial-Risk signal (quarterly leverage trend)...")
+        fr_sig = compute_filings_fr_signal(TICKER, END_DATE)
+        if fr_sig:
+            top_signals.append(fr_sig)
+            print(f"  [filings FR] {fr_sig['direction']}: {fr_sig['event_summary']}")
+        else:
+            print("  [filings FR] no material leverage trend (or insufficient quarterly data)")
+
+    # ── Market snapshot as of end date (summary-level, not per signal) ──
+    market_ctx = None
+    if USE_MARKET_SNAPSHOT and USE_LLM_JUDGE and top_signals:
+        print("\n[Phase 5b] Market snapshot as of end date...")
+        market_ctx = compute_market_context(top_signals, TICKER, START_DATE, END_DATE)
+
+    # Point-in-time market cap = end-date price x shares outstanding (free, as-of-window).
+    if market_ctx and market_ctx.get("last_close") and financials.get("shares_outstanding"):
+        financials["market_cap"] = market_ctx["last_close"] * financials["shares_outstanding"]
+        financials["market_cap_basis"] = f"price on {market_ctx.get('window_end')} x shares"
+        financials["summary"] = _fin_summary(financials)
+
+    # Stable display number per signal (matches the report [n]), so key figures can
+    # cite their source compactly as "#n" instead of repeating the headline.
+    _r = 0
+    for category in ("Business Risk", "Financial Risk"):
+        for s in top_signals:
+            if s.get("risk_category") == category and "ref" not in s:
+                _r += 1
+                s["ref"] = _r
+    for s in top_signals:
+        if "ref" not in s:
+            _r += 1
+            s["ref"] = _r
+
+    # Aggregate the hard numbers cited across all reported signals (dedup, for summary).
+    # Each carries the source signal number (#ref) + headline + url it was verified against.
+    agg_figures, _seen = [], set()
+    for s in top_signals:
+        for f in (s.get("key_figures") or []):
+            item = f"{f.get('metric', '')}: {f.get('value', '')}".strip(": ").strip()
+            if item and item.lower() not in _seen:
+                _seen.add(item.lower())
+                agg_figures.append({
+                    "figure":  item,
+                    "ref":     s.get("ref"),
+                    "date":    s.get("date", ""),
+                    "source":  (s.get("headline") or "")[:70],
+                    "url":     s.get("url", ""),
+                })
 
     # ── Output ────────────────────────────────────────────────────
     print_report(top_signals, TICKER, COMPANY_NAME, target_sector["sector_name"])
 
     score_result = compute_credit_score(top_signals, END_DATE)
+    score_result["stability"] = bootstrap_score_band(top_signals, END_DATE)
+    contradictions = find_contradictions(top_signals)
     print_score_summary(score_result, TICKER, COMPANY_NAME)
+    print_end_date_snapshot(END_DATE, financials if USE_LLM_JUDGE else None,
+                            market_ctx, agg_figures, score_result, TICKER, COMPANY_NAME,
+                            contradictions)
+
+    financial_panel = None
+    if USE_LLM_JUDGE and USE_FINANCIAL_PANEL:
+        financial_panel = compute_financial_panel(TICKER, END_DATE)
+        print_financial_panel(financial_panel, TICKER, COMPANY_NAME)
+
+    print_news_digest(news_digest, encoder, show_equity=SHOW_EQUITY_NEWS)
 
     output = {
         "ticker":            TICKER,
@@ -1133,6 +2546,7 @@ def run_pipeline():
             "min_judge_confidence": MIN_JUDGE_CONFIDENCE if USE_LLM_JUDGE else None,
             "crossencoder_model":   CROSSENCODER_MODEL if USE_LLM_JUDGE else None,
             "crossencoder_top_n":   CROSSENCODER_TOP_N if USE_LLM_JUDGE else None,
+            "show_equity_news":     SHOW_EQUITY_NEWS,
             "use_finbert":          USE_FINBERT if USE_LLM_JUDGE else False,
             "similarity_threshold": SIMILARITY_THRESHOLD,
             "dedup_threshold":      DEDUP_THRESHOLD,
@@ -1146,8 +2560,14 @@ def run_pipeline():
             "unique_signals":      len(unique_signals),
             "reported_signals":    len(top_signals),
         },
+        "company_financials": financials if USE_LLM_JUDGE else None,
+        "financial_panel":    financial_panel,
+        "market_context":     market_ctx,
+        "key_figures_summary": agg_figures,
+        "contradictions":     contradictions,
         "credit_score": score_result,
         "signals": top_signals,
+        "news_digest": news_digest,
     }
 
     os.makedirs("results", exist_ok=True)
