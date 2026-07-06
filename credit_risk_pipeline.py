@@ -114,9 +114,22 @@ COMPANY_NAME    = "Boeing"
 START_DATE      = "2026-05-01"
 END_DATE        = "2026-06-30"
 
-# --- Cross-encoder relevance filter (judge path, Phase 2) ---
+# --- Phase 2 relevance filter: LLM triage (default) or cross-encoder (fallback) ---
+# The cross-encoder (ms-marco) ranked headline+summary against dense S&P prose criteria by
+# SURFACE similarity -- it rewarded generic money/dollar language and was nearly insensitive
+# to which criteria it was given (a "Crusoe $30B, $3B debt" headline out-ranked "Meta will
+# spend $135B on AI" no matter the sector). Judging credit-materiality needs REASONING
+# (capex -> leverage -> credit-negative), which only an LLM can do. So Phase 2 now runs a
+# cheap LLM that scores each on-topic article 0-10 for credit-materiality; the survivors go
+# to the full judge. Falls back to the cross-encoder if OpenRouter is unavailable.
+USE_LLM_TRIAGE      = True
+TRIAGE_MODEL        = "google/gemini-2.5-flash-lite"  # cheap OpenRouter model for triage
+TRIAGE_MIN_SCORE    = 5      # keep articles scoring >= this (0-10) for the judge
+TRIAGE_MAX_KEEP     = 40     # hard cap forwarded to the judge (cost ceiling)
+TRIAGE_BATCH_SIZE   = 30     # articles scored per triage call
+
 CROSSENCODER_MODEL  = "cross-encoder/ms-marco-MiniLM-L6-v2"
-CROSSENCODER_TOP_N  = 40    # articles forwarded to Claude after CE filter
+CROSSENCODER_TOP_N  = 40    # articles forwarded to Claude after CE filter (fallback path)
                             # (raised 25->40: 2-3 material signals per run was too thin
                             #  for a reliable score; ~$0.05/issuer at Haiku-4.5 rates)
 MAX_ARTICLE_CHARS   = 4000  # character limit for article text sent to the judge
@@ -154,6 +167,8 @@ USE_GDELT       = True
 USE_GOOGLE_NEWS = False
 GDELT_MAX       = 100   # cap on GDELT items pulled per run (API max 250)
 GOOGLE_NEWS_MAX = 100   # cap on Google News items pulled per run
+GDELT_CACHE_TTL = 43200 # seconds (12h) to reuse a cached GDELT response for the same
+                        # ticker+window, so repeated runs don't re-hit GDELT's 1-req/5s limit
 
 # --- Bootstrap uncertainty band (Phase 5 scoring) ---
 BOOTSTRAP_RESAMPLES     = 1000  # resamples of the signal set for the score band
@@ -164,27 +179,20 @@ BOOTSTRAP_SEED          = 42    # fixed seed -> reproducible band for the same s
 USE_MARKET_SNAPSHOT     = True
 MARKET_BENCHMARK        = "^GSPC"   # benchmark for the window abnormal-return calc
 
-# --- Deterministic Financial-Risk channel from quarterly filings (Phase 5c) ---
-# Adds a leverage-trend Financial Risk signal computed straight from yfinance quarterly
-# statements -- no news, no LLM. Catches quiet balance-sheet moves that never make
-# headlines (the ADEA deleveraging / WBD zero-news blind spots) and fires even when the
-# news channel returns nothing. Only emits a signal when the trend is material.
+# --- Deterministic fundamentals signal from quarterly filings (Phase 5c) ---
+# A credit signal built straight from yfinance quarterly statements -- no news, no LLM.
+# Votes across revenue / EBITDA margin / free cash flow / net leverage (see
+# compute_fundamentals_signal): NEGATIVE on rising leverage, POSITIVE on broad corroborated
+# improvement. Fires even when the news channel returns nothing, so fundamentally strong but
+# quiet names (e.g. SanDisk) are not scored blank.
 USE_FILINGS_FR          = True
-FILINGS_FR_MIN_CHANGE   = 0.10   # net-debt change over the window must exceed +/-10% to signal
-FILINGS_FR_MAX_CONF     = 0.90   # confidence cap for the deterministic signal
 
 # --- Always-on quarterly fundamentals panel (descriptive, not scored) ---
 # Prints the key credit metrics and their trend every run (revenue, net income, margins,
 # EBITDA, free cash flow, debt, net debt) from yfinance quarterly statements -- so the
-# analyst always sees the financial picture even when no news/leverage SIGNAL fires.
+# analyst always sees the financial picture even when no signal fires.
 USE_FINANCIAL_PANEL      = True
 FINANCIAL_PANEL_QUARTERS = 4     # number of recent quarters shown side by side
-# Negative-biased on purpose: rising leverage is a reliable credit warning, but FALLING
-# leverage is NOT reliable evidence of improvement -- it routinely coexists with a downgrade
-# driven by strategy/litigation/sector (observed: PSKY deleveraged 10% into a CreditWatch
-# negative). Emitting a positive here creates false-positive upgrades, so we stay silent on
-# deleveraging until we have EDGAR-grade data. Set False to also emit positive signals.
-FILINGS_FR_NEGATIVE_ONLY = True
 
 # --- Point-in-time financials (Phase 1) ---
 # Use the latest quarterly statement whose period-end is on/before END_DATE. yfinance
@@ -216,8 +224,14 @@ USE_LLM_SECTOR_ROUTING = True
 # primary BR/FR signal report; it is not repeated here. Shows the top few equity stories by
 # coverage, each with a one-line summary. SHOW_EQUITY_NEWS hides it (CLI 6th arg "noequity").
 SHOW_EQUITY_NEWS     = True
-DIGEST_TOP_EQUITY    = 3      # equity/market stories shown (secondary)
+DIGEST_TOP_EQUITY    = 5      # equity/market stories shown (secondary), ranked by substance
 DIGEST_CLUSTER_SIM   = 0.60   # headline cosine >= this = same story, different outlet
+
+# "Developing / reviewed" section: credit-relevant stories the judge read but that were not
+# (yet) a rating event -- the forward-looking business news (capex plans, strategic shifts,
+# deals in progress). Shown on EVERY run so a report always surfaces >= this many stories,
+# even at zero material signals. Context only -- these do NOT enter the credit score.
+DEVELOPING_NEWS_N    = 3
 
 # Runtime judge menu. Each entry: (label, backend, model_id).
 # OpenRouter cost estimates are per issuer (~25 articles); see README for method.
@@ -512,12 +526,23 @@ _COMPANY_NAME_SUFFIXES = {
 def build_entity_matcher(company_name, ticker):
     """
     Return a predicate article -> bool that decides whether an article is actually ABOUT
-    this issuer. Aliases = significant tokens of the company name (suffixes like
-    Inc/Corp/.com stripped, matched as whole words); the ticker is matched separately as
-    a CASE-SENSITIVE whole word so short tickers (BA, CE, MU) don't match lowercase
-    substrings ("ba" in "bank"). Finnhub tags a lot of generic market commentary to
-    mega-cap tickers (e.g. ~66% of Amazon's feed never names Amazon) -- this gate removes
-    that noise before it can fill the Phase 2 top-N with irrelevant articles.
+    this issuer -- i.e. the issuer is the PRIMARY SUBJECT, not a passing mention. Aliases =
+    significant tokens of the company name (suffixes like Inc/Corp/.com stripped, matched
+    as whole words); the ticker is matched separately as a CASE-SENSITIVE whole word so
+    short tickers (BA, CE, MU) don't match lowercase substrings ("ba" in "bank").
+
+    Finnhub tags a lot of generic market commentary to mega-cap tickers (e.g. ~66% of
+    Amazon's feed never names Amazon; a "CoreWeave buying opportunity" story that merely
+    mentions Meta). A plain does-the-word-appear test lets that noise fill the Phase 2
+    top-N and waste the judge budget -- 39/40 get rejected downstream as immaterial. So the
+    gate keeps an article only when the issuer OWNS it:
+
+        - named in the HEADLINE (headlines name their subject), OR
+        - named >= 2 times across headline + summary (repeated => genuinely discussed).
+
+    A single body-only mention (the classic passing reference) is dropped here, before the
+    cross-encoder ever sees it. run_pipeline keeps the full feed as a fallback if this
+    matches nothing (name-spelling mismatch), so a strict gate can never zero out coverage.
     """
     tokens  = [t.lower() for t in re.split(r"[^A-Za-z0-9]+", company_name or "") if t]
     aliases = [t for t in tokens if len(t) >= 3 and t not in _COMPANY_NAME_SUFFIXES]
@@ -525,10 +550,20 @@ def build_entity_matcher(company_name, ticker):
                           re.IGNORECASE) if aliases else None)
     ticker_re = re.compile(r"\b" + re.escape(ticker) + r"\b") if ticker else None
 
+    def _count(text):
+        n = 0
+        if name_re:
+            n += len(name_re.findall(text))
+        if ticker_re:
+            n += len(ticker_re.findall(text))
+        return n
+
     def is_about(article):
-        text = f"{article.get('headline', '') or ''} {article.get('summary', '') or ''}"
-        return bool((name_re and name_re.search(text))
-                    or (ticker_re and ticker_re.search(text)))
+        headline = article.get("headline", "") or ""
+        summary  = article.get("summary", "") or ""
+        in_headline = bool((name_re and name_re.search(headline))
+                           or (ticker_re and ticker_re.search(headline)))
+        return in_headline or _count(f"{headline} {summary}") >= 2
 
     return is_about
 
@@ -596,19 +631,51 @@ def fetch_google_news(company_name, ticker, start_date, end_date, max_items=GOOG
     return out
 
 
+def _core_company_name(company_name):
+    """Company name with corporate suffixes stripped (Inc/Corp/Corporation/Holdings/...), so
+    a news search matches how articles actually refer to the issuer -- 'SanDisk', not the
+    exact phrase 'Sandisk Corporation' (which few articles use)."""
+    toks = [t for t in re.split(r"[^A-Za-z0-9]+", company_name or "") if t]
+    core = [t for t in toks if t.lower() not in _COMPANY_NAME_SUFFIXES]
+    return " ".join(core) or (company_name or "").strip()
+
+
+def _gdelt_cache_path(ticker, start_date, end_date):
+    d = Path(__file__).resolve().parent / ".cache"
+    try:
+        d.mkdir(exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return d / f"gdelt_{ticker}_{start_date}_{end_date}.json"
+
+
 def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT_MAX):
     """
     Supplementary free news via the GDELT DOC 2.0 API (no API key). Returns Finnhub-shaped
     dicts with REAL publisher URLs (unlike Google News' base64 redirects), so the judge can
     read full article text. English sources only; date-windowed. GDELT carries no per-article
-    snippet, so the title doubles as the summary. Best-effort: returns [] on any failure.
+    snippet, so the title doubles as the summary.
+
+    Searches the CORE company name (suffixes stripped) to match how articles refer to the
+    issuer, and caches successful responses per ticker+window (GDELT_CACHE_TTL) so repeated
+    runs don't re-hit GDELT's strict 1-request/5s limit. Best-effort: returns [] on failure.
     """
     from urllib.parse import quote
+
+    # Serve from cache when fresh -- avoids re-hitting the rate limit on repeated runs.
+    cache = _gdelt_cache_path(ticker, start_date, end_date)
+    try:
+        if cache.exists() and (time.time() - cache.stat().st_mtime) < GDELT_CACHE_TTL:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if cached:
+                return cached[:max_items]
+    except Exception:  # noqa: BLE001
+        pass
 
     def _stamp(d, tail):
         return d.replace("-", "") + tail
 
-    query = f'"{company_name}" sourcelang:english'
+    query = f'"{_core_company_name(company_name)}" sourcelang:english'
     url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + quote(query)
            + "&mode=ArtList&format=json&sort=DateDesc"
            + f"&maxrecords={min(250, max_items)}"
@@ -652,6 +719,12 @@ def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT
         })
         if len(out) >= max_items:
             break
+
+    if out:  # cache only successful (non-empty) fetches so a throttled run retries next time
+        try:
+            cache.write_text(json.dumps(out), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
     return out
 
 
@@ -728,6 +801,87 @@ def filter_with_crossencoder(news_data, criteria_texts, criteria_labels, top_n=C
 
 
 # ==========================================
+# PHASE 2 (DEFAULT): LLM CREDIT-MATERIALITY TRIAGE
+# ==========================================
+
+def build_triage_prompt(company, sector_name, sector_factors, batch):
+    """Batch prompt: score each article 0-10 for credit-rating materiality to THIS issuer."""
+    lines = []
+    for i, a in enumerate(batch):
+        headline = (a.get("headline", "") or "").strip()
+        summary  = (a.get("summary", "") or "").strip()[:200]
+        lines.append(f"{i}. {headline} -- {summary}")
+    return (
+        "You are an S&P credit analyst triaging news for BONDHOLDER (credit-rating) relevance, "
+        "NOT equity upside.\n"
+        f"TARGET COMPANY: {company}   |   S&P SECTOR: {sector_name}\n\n"
+        "Score EACH article 0-10 by how likely it describes a MATERIAL CREDIT event for THIS "
+        "company -- something bearing on leverage, debt, liquidity, cash flow, margins, "
+        "refinancing, covenants, or a major financial/strategic shift such as a large "
+        "debt-funded capex or acquisition program.\n"
+        "SCORING:\n"
+        "  0-2 : pure stock-price move, analyst rating/price target, hype, or the company is "
+        "only a bystander/passing mention\n"
+        "  3-4 : tangential or vague; company-specific credit impact unclear\n"
+        "  5-7 : plausible credit-relevant event, some financial substance\n"
+        "  8-10: clearly material credit event with concrete financial substance "
+        "(debt, capex scale, cash-flow/margin/leverage change)\n\n"
+        f"SECTOR RISK FACTORS (what matters for credit here):\n{sector_factors}\n\n"
+        f"ARTICLES:\n" + "\n".join(lines) + "\n\n"
+        'Respond with ONLY compact JSON, one entry per article id above, no prose:\n'
+        '{"scores":[{"id":0,"s":7},{"id":1,"s":2}]}'
+    )
+
+
+def triage_articles(articles, company, sector_name, criteria_texts):
+    """
+    Cheap-LLM relevance triage (replaces the cross-encoder). Scores every on-topic article
+    0-10 for credit-materiality via a cheap model, in parallel batches, and returns them
+    annotated with `_triage_score`, sorted high-to-low. Each article is handed the FULL set
+    of sector criteria as its judge anchor (the judge decides the final risk_category itself).
+
+    Unlike the cross-encoder -- which matched surface money-language and ignored credit
+    causality -- the LLM understands that "debt-funded $135B capex" is a leverage event.
+    """
+    sector_factors = "\n".join(f"- {c}" for c in criteria_texts)
+    all_criteria   = "\n".join(criteria_texts)
+    batches = [articles[i:i + TRIAGE_BATCH_SIZE]
+               for i in range(0, len(articles), TRIAGE_BATCH_SIZE)]
+
+    def run_batch(indexed_batch):
+        bi, batch = indexed_batch
+        prompt = build_triage_prompt(company, sector_name, sector_factors, batch)
+        try:
+            content = _openrouter_chat(prompt, TRIAGE_MODEL, max_tokens=1200)
+            obj     = _extract_json_obj(content) or {}
+            local   = {}
+            for e in obj.get("scores", []):
+                try:
+                    local[int(e["id"])] = max(0.0, min(10.0, float(e["s"])))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return bi, local
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [triage batch {bi} skipped] {str(exc).splitlines()[0][:100]}")
+            return bi, {}
+
+    with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
+        results = list(pool.map(run_batch, list(enumerate(batches))))
+
+    scored = []
+    for bi, local in results:
+        for idx, article in enumerate(batches[bi]):
+            a = dict(article)
+            a["_triage_score"]    = local.get(idx, 0.0)
+            a["matched_criterion"] = all_criteria    # judge anchor (was single CE best-match)
+            a["risk_category"]     = "Business Risk"  # placeholder; the judge overwrites this
+            scored.append(a)
+
+    scored.sort(key=lambda x: x["_triage_score"], reverse=True)
+    return scored
+
+
+# ==========================================
 # PHASE 3 HELPERS: FULL-TEXT SCRAPING
 # ==========================================
 
@@ -740,23 +894,51 @@ _SCRAPE_HEADERS = {
 }
 
 
+_TRAFILATURA = None
+
+
+def _extract_trafilatura(html, url):
+    """Extract article body with trafilatura (higher hit-rate than newspaper3k on modern
+    news layouts/paywalls). Returns text or None; lazily imported, disabled if unavailable."""
+    global _TRAFILATURA
+    if _TRAFILATURA is None:
+        try:
+            import trafilatura
+            _TRAFILATURA = trafilatura
+        except Exception:  # noqa: BLE001
+            _TRAFILATURA = False
+    if not _TRAFILATURA:
+        return None
+    try:
+        return _TRAFILATURA.extract(html, url=url, include_comments=False,
+                                    include_tables=False, favor_recall=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def scrape_full_text(url, fallback_summary):
     """
-    Downloads raw HTML via requests (8-second hard timeout) then passes it to
-    newspaper3k for local parsing. Returns (text, resolved_url).
+    Downloads raw HTML via requests (8-second hard timeout) then extracts the article body.
+    Returns (text, resolved_url).
 
-    resolved_url follows Finnhub's `finnhub.io/api/news?id=...` redirect to the real
-    publisher article (requests follows the 302 automatically), so the stored/displayed
-    source link is actually clickable instead of a dead API URL. Falls back to the Finnhub
-    summary text, and to the original url, when the request fails.
+    Extraction order: trafilatura first (best hit-rate on modern layouts), then newspaper3k,
+    then the Finnhub/GDELT summary fallback. resolved_url follows the provider's redirect
+    (e.g. Finnhub's `api/news?id=...`) to the real publisher article, so the stored/displayed
+    source link is clickable. Falls back to the original url when the request fails.
     """
     final_url = url
     try:
         response = requests.get(url, timeout=8, headers=_SCRAPE_HEADERS)
         final_url = response.url or url          # resolved publisher URL after redirects
         response.raise_for_status()
+        html = response.text
+
+        text = _extract_trafilatura(html, final_url)
+        if text and len(text.split()) > 100:
+            return text, final_url
+
         article = Article(final_url)
-        article.set_html(response.text)
+        article.set_html(html)
         article.parse()
         if len(article.text.split()) > 100:
             return article.text, final_url
@@ -950,8 +1132,8 @@ def _judge_via_claude_cli(prompt):
     return _parse_judge_json(res.stdout.strip())
 
 
-def _judge_via_openrouter(prompt):
-    """One judgment via the OpenRouter HTTP API. Raises on failure."""
+def _openrouter_chat(prompt, model, max_tokens=500):
+    """Raw OpenRouter chat completion. Returns the message content string. Raises on failure."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set")
     resp = requests.post(
@@ -963,17 +1145,21 @@ def _judge_via_openrouter(prompt):
             "X-Title": "Joywin Credit Risk Pipeline",
         },
         json={
-            "model": JUDGE_MODEL,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": 500,
+            "max_tokens": max_tokens,
         },
         timeout=JUDGE_TIMEOUT,
     )
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    content = resp.json()["choices"][0]["message"]["content"]
-    return _extract_json_obj(content)
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def _judge_via_openrouter(prompt):
+    """One judgment via the OpenRouter HTTP API. Raises on failure."""
+    return _extract_json_obj(_openrouter_chat(prompt, JUDGE_MODEL, max_tokens=500))
 
 
 def judge_article(company, sector_name, matched_criterion, headline, article_text,
@@ -1001,9 +1187,11 @@ def judge_article(company, sector_name, matched_criterion, headline, article_tex
 
 def run_judge_articles(articles, company, sector_name, debt_context=""):
     """
-    Judge all filtered articles in parallel. Each article dict must have full_text,
-    matched_criterion, headline keys. Returns the subset the judge marks material
-    and confident, with verdict fields merged in.
+    Judge all filtered articles in parallel. Returns (materials, near_misses):
+      - materials  : articles the judge marked material AND confident (>= MIN_JUDGE_CONFIDENCE)
+      - near_misses: everything else it judged (immaterial or below the bar), sorted by
+                     confidence -- surfaced as "closest candidates" when nothing qualifies,
+                     so a 0-signal run still shows the analyst what was reviewed.
     """
     def work(article):
         verdict = judge_article(
@@ -1013,17 +1201,15 @@ def run_judge_articles(articles, company, sector_name, debt_context=""):
             article.get("full_text", ""),
             debt_context,
         )
-        if not verdict or not verdict.get("material"):
+        if not verdict:
             return None
         try:
             confidence = float(verdict.get("confidence", 0))
         except (TypeError, ValueError):
             confidence = 0.0
-        if confidence < MIN_JUDGE_CONFIDENCE:
-            return None
         out = dict(article)
         out.update({
-            "material":      True,
+            "material":      bool(verdict.get("material")),
             "risk_category": verdict.get("risk_category", "Neither"),
             "sp_factor":     verdict.get("sp_factor", ""),
             "direction":     verdict.get("direction", "neutral"),
@@ -1036,8 +1222,16 @@ def run_judge_articles(articles, company, sector_name, debt_context=""):
         return out
 
     with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
-        verdicts = list(pool.map(work, articles))
-    return [v for v in verdicts if v is not None]
+        judged = [v for v in pool.map(work, articles) if v is not None]
+
+    materials, near = [], []
+    for r in judged:
+        if r["material"] and r["confidence"] >= MIN_JUDGE_CONFIDENCE:
+            materials.append(r)
+        else:
+            near.append(r)
+    near.sort(key=lambda r: r["confidence"], reverse=True)
+    return materials, near
 
 
 # ==========================================
@@ -1086,24 +1280,6 @@ def add_finbert_tone(signals):
         else:
             sig["tone_alignment"] = "mixed"
     return signals
-
-
-# ==========================================
-# PHASE 4 LEGACY HELPER: PER-ARTICLE CAP
-# ==========================================
-
-def cap_per_article(signals, max_per_article):
-    """Keep at most max_per_article signals per URL (legacy path; judge path is 1 by design)."""
-    ranked = sorted(signals, key=lambda s: s.get("confidence", s.get("similarity_score", 0)),
-                    reverse=True)
-    counts, kept = {}, []
-    for s in ranked:
-        url = s.get("url", "")
-        if counts.get(url, 0) >= max_per_article:
-            continue
-        counts[url] = counts.get(url, 0) + 1
-        kept.append(s)
-    return kept
 
 
 # ==========================================
@@ -1326,6 +1502,88 @@ def classify_news_topic(text):
     return "equity" if (eq > 0 and eq >= bz) else "business"
 
 
+# Within the equity bucket, grade a story by SUBSTANCE. We want the BUSINESS events that
+# actually move the stock for a real reason -- launches, deals, capex, strategic shifts,
+# results -- and we deliberately DEMOTE analyst price-target/rating calls and valuation
+# opinions ("21% undervalued"), which are commentary, not events. Deterministic, no LLM.
+_EQ_CATALYST = (          # a real business event driving the move (weighted UP hardest)
+    "launch", "launches", "launched", "unveil", "unveils", "announces", "announced",
+    "to sell", "new business", "enters", "entering", "expands into", "rolls out",
+    "rolling out", "builds", "building", "plans to", "deal", "agreement", "contract",
+    "partnership", "partners with", "acquire", "acquires", "acquisition", "merger",
+    "invest", "investment", "capex", "capital expenditure", "to spend", "spend",
+    "spends", "spending", "billion on",
+    "chip", "data center", "cloud", "factory", "plant", "facility", "fab", "product",
+    "wins", "secures", "signs", "signed", "supply", "hires", "appoints", "names",
+    "lawsuit", "settlement", "antitrust", "regulator", "probe", "recall", "ban",
+    "results", "earnings", "revenue", "guidance", "layoff", "job cuts", "restructur",
+)
+_EQ_GROWTH = (            # demonstrated demand / share / scale (weighted UP)
+    "growth", "expansion", "expand", "expanding", "new market", "capacity", "backlog",
+    "demand", "tam", "addressable market", "market share", "record revenue",
+    "record sales", "ramp", "roadmap", "orders", "adoption", "scaling", "penetration",
+)
+_EQ_ANALYST = (           # analyst prediction / rating -- NOT a business event (DEMOTED)
+    "price target", "raises target", "cuts target", "target to", "pt to", "sees upside",
+    "upside for", "% upside", "buy rating", "hold rating", "sell rating", "outperform",
+    "overweight", "underweight", "reiterat", "initiates", "initiated", "analyst says",
+    "analysts say", "analyst", "price prediction", "will hit", "stock forecast",
+)
+_EQ_VALUATION = (         # valuation opinion -- commentary, not an event (DEMOTED)
+    "undervalued", "overvalued", "fair value", "intrinsic", "p/e", "pe ratio", "multiple",
+    "trading at", "cheap", "expensive", "discount", "worth", "dcf", "ev/ebitda",
+    "should you buy", "is it a buy", "better buy", "still a buy", "time to sell",
+)
+_EQ_HYPE = (              # pure price action / roundups (DEMOTED)
+    "all-time high", "52-week", "52 week", "stock split", "most-searched", "top-searched",
+    "momentum", "futures", "meme", "retail traders", "surge", "surges", "plunge",
+    "plunges", "rally", "rallies", "soar", "soars", "sink", "sinks", "tumble", "jumps",
+    "% since", "skyrocket", "dow jones", "nasdaq", "crash", "fomo", "why is",
+)
+
+
+def classify_equity_subtopic(text):
+    """Grade an equity story by substance. Returns (label, score): label in
+    {Catalyst, Growth, Analyst, Valuation, Price}. Business catalysts and demonstrated
+    growth are weighted UP; analyst price-target/rating calls, valuation opinions, and
+    pure price action are weighted DOWN -- so the digest surfaces news that moves the
+    stock for a real business reason, not commentary."""
+    t = (text or "").lower()
+    c = sum(1 for m in _EQ_CATALYST if m in t)
+    g = sum(1 for m in _EQ_GROWTH if m in t)
+    a = sum(1 for m in _EQ_ANALYST if m in t)
+    v = sum(1 for m in _EQ_VALUATION if m in t)
+    h = sum(1 for m in _EQ_HYPE if m in t)
+    score = 2 * c + 2 * g - 2 * a - 2 * v - h
+    if c and c >= g:
+        label = "Catalyst"
+    elif g:
+        label = "Growth"
+    elif a:
+        label = "Analyst"
+    elif v:
+        label = "Valuation"
+    else:
+        label = "Price"
+    return label, score
+
+
+def _issuer_lead_penalty(headline, name_tokens):
+    """Penalty (>=0) for stories where the issuer is NOT the lead subject of the headline --
+    e.g. 'CoreWeave Takes Another Hit From Meta' names Meta only at the end. If the issuer
+    first appears in the back half of the headline (or not at all), it is probably a
+    bystander mention, not the subject; such items are demoted out of the digest."""
+    t = (headline or "").lower()
+    earliest = None
+    for tok in name_tokens:
+        idx = t.find(tok)
+        if idx >= 0:
+            earliest = idx if earliest is None else min(earliest, idx)
+    if earliest is None:            # issuer not in the headline at all -> heavy penalty
+        return 5
+    return 5 if (earliest / max(1, len(t))) > 0.5 else 0
+
+
 def build_news_digest(articles):
     """Lightweight 'what's happening' list from the on-topic articles (no LLM cost).
     Every article the issuer was named in, newest first, whether or not it is
@@ -1355,15 +1613,17 @@ def _clean_text(s):
     return "".join(c for c in (s or "").replace("\n", " ") if c.isprintable())
 
 
-def _short_summary(text, width=110):
-    """First sentence of the Finnhub summary, capped to one short line."""
+def _first_sentences(text, n=2, max_chars=320):
+    """First n sentences of a summary, capped -- keeps the digest scannable instead of
+    dumping a whole article body (some feeds put a wall of text in the summary field)."""
     t = _clean_text(text).strip()
     if not t:
         return ""
-    first = re.split(r"(?<=[.!?])\s", t, maxsplit=1)[0]
-    if len(first) > width:
-        first = first[:width].rsplit(" ", 1)[0] + "..."
-    return first
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    out = " ".join(parts[:n]).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars].rsplit(" ", 1)[0].rstrip(",.;:") + "..."
+    return out
 
 
 def cluster_top_news(items, encoder, k):
@@ -1389,37 +1649,90 @@ def cluster_top_news(items, encoder, k):
     return clusters[:k]
 
 
-def _print_digest_block(clusters):
-    for rep, cnt in clusters:
-        tag = f"  ({cnt} outlets)" if cnt > 1 else ""
-        print(f"  {rep['date']}{tag}")
-        for line in textwrap.wrap(_clean_text(rep["headline"]), width=78,
-                                  initial_indent="    ", subsequent_indent="    "):
-            print(line)
-        summ = _clean_text(rep.get("summary", "")).strip()
-        if summ:
-            for line in textwrap.wrap(summ, width=78, initial_indent="      ",
-                                      subsequent_indent="      "):
-                print(line)
-        if rep.get("url"):
-            print(f"      {rep['url']}")   # raw + full so it copy-pastes intact
-
-
-def print_news_digest(digest, encoder, show_equity=True):
-    """SECONDARY section only: top equity/market stories by coverage, each with a short
-    summary. Credit-relevant news is the primary BR/FR signal report above, not repeated."""
+def print_news_digest(digest, encoder, company_name="", ticker="", show_equity=True):
+    """SECONDARY section: the equity/market stories that move the stock for a real BUSINESS
+    reason -- launches, deals, capex, strategic shifts, results -- surfaced over analyst
+    price-target/rating calls and valuation opinions, which are demoted. Bystander stories
+    (issuer not the headline subject) are dropped. Credit-relevant news is the report above."""
     equity = [d for d in digest if d.get("topic") == "equity"]
     if not show_equity:
         if equity:
             print(f"\n  (equity/market news hidden -- SHOW_EQUITY_NEWS=False; {len(equity)} in JSON)")
         return
-    top_eq = cluster_top_news(equity, encoder, DIGEST_TOP_EQUITY)
-    if not top_eq:
+    if not equity:
+        return
+
+    # Issuer name tokens (suffixes stripped) + ticker -- to detect bystander headlines.
+    toks = [t.lower() for t in re.split(r"[^A-Za-z0-9]+", company_name or "") if t]
+    name_tokens = [t for t in toks if len(t) >= 3 and t not in _COMPANY_NAME_SUFFIXES]
+    if ticker:
+        name_tokens.append(ticker.lower())
+
+    # Cluster same-story items, then rank by BUSINESS SUBSTANCE (catalysts/growth up,
+    # analyst/valuation/price down) minus a bystander penalty; coverage is only the tiebreak.
+    clusters = cluster_top_news(equity, encoder, len(equity))
+    ranked   = []
+    for rep, cnt in clusters:
+        label, score = classify_equity_subtopic(f"{rep.get('headline', '')} {rep.get('summary', '')}")
+        score -= _issuer_lead_penalty(rep.get("headline", ""), name_tokens)
+        ranked.append((rep, cnt, label, score))
+    # Drop analyst-prediction / valuation-opinion / bystander items (net-negative substance).
+    ranked = [r for r in ranked if r[3] > 0]
+    ranked.sort(key=lambda x: (x[3], x[1]), reverse=True)
+    top = ranked[:DIGEST_TOP_EQUITY]
+    if not top:
+        return
+
+    print("\n" + "=" * 72)
+    print("  SECONDARY -- BUSINESS / MARKET-MOVING NEWS  (not credit-scored)")
+    print("  business catalysts (launches, deals, capex, results)  >  analyst / price calls")
+    print("=" * 72)
+    for rep, cnt, label, _score in top:
+        outlets = f"{cnt} outlets" if cnt > 1 else "1 outlet"
+        print(f"\n  [{label:<9}]  {rep['date']}   ({outlets})")
+        for line in textwrap.wrap(_clean_text(rep["headline"]), width=74,
+                                  initial_indent="     ", subsequent_indent="     "):
+            print(line)
+        summ = _first_sentences(rep.get("summary", ""), n=2)
+        if summ:
+            for line in textwrap.wrap(summ, width=74, initial_indent="       ",
+                                      subsequent_indent="       "):
+                print(line)
+        if rep.get("url"):
+            print(f"       {rep['url']}")   # raw + full so it copy-pastes intact
+    print("=" * 72)
+
+
+def developing_news_items(near, n=DEVELOPING_NEWS_N):
+    """The n credit-relevant stories the judge read but that were not (yet) a rating event --
+    highest judge-confidence first. These are the forward-looking business developments
+    (capex plans, strategic shifts, deals in progress). Context only -- NOT scored."""
+    return [x for x in near if x.get("event_summary")][:max(n, DEVELOPING_NEWS_N)]
+
+
+def print_developing_news(near, has_material, n=DEVELOPING_NEWS_N):
+    """Shown on EVERY run so a report always surfaces credit-relevant context, even at zero
+    material signals. These are reviewed-but-not-yet-material stories; they do NOT enter the
+    credit score (the score is material judge signals + the fundamentals signal only)."""
+    cand = developing_news_items(near, n)
+    if not cand:
         return
     print("\n" + "=" * 65)
-    print("  SECONDARY -- TOP EQUITY / MARKET NEWS  (not credit-scored)")
+    print("  DEVELOPING / REVIEWED -- credit-relevant, not yet a rating event")
+    note = ("context for the score above" if has_material
+            else f"no article cleared the {MIN_JUDGE_CONFIDENCE:.2f} materiality bar")
+    print(f"  ({note}; not scored)")
     print("=" * 65)
-    _print_digest_block(top_eq)
+    for i, s in enumerate(cand, 1):
+        arrow = {"positive": "[+]", "negative": "[-]"}.get(s.get("direction"), "[=]")
+        print(f"\n  [{i}]  {s.get('date', '')}  |  judge confidence {s.get('confidence', 0)}"
+              f"  |  {arrow} {s.get('direction', 'neutral')}")
+        print(_wrap_field("Event", s.get("event_summary", "")))
+        if s.get("headline"):
+            print(_wrap_field("Headline", s.get("headline", "")))
+        if s.get("url"):
+            print(f"  Source    : {s['url']}")
+    print("=" * 65)
 
 
 def print_report(signals, ticker, company_name, sector_name):
@@ -1629,6 +1942,40 @@ def bootstrap_score_band(signals, end_date_str,
 # MARKET & COMPANY CONTEXT
 # ==========================================
 
+def compute_52w_range(ticker, end_date):
+    """
+    Trailing-12-month price range AS OF end_date (point-in-time -- only closes on/before
+    end_date, no look-ahead), from yfinance. Returns {low, high, last, pct_in_range,
+    descriptor} showing where the current price sits within its 52-week band, or None.
+    """
+    try:
+        end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        return None
+    start    = (end_dt - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+    end_excl = (end_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        h = yf.Ticker(yf_symbol(ticker)).history(start=start, end=end_excl, auto_adjust=True)
+        closes = [float(c) for c in h["Close"].tolist() if c == c]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(closes) < 2:
+        return None
+
+    low, high, last = min(closes), max(closes), closes[-1]
+    pct = ((last - low) / (high - low) * 100) if high > low else None
+    if pct is None:
+        desc = ""
+    elif pct >= 80:
+        desc = "near 52-wk high"
+    elif pct <= 20:
+        desc = "near 52-wk low"
+    else:
+        desc = "mid-range"
+    return {"low": round(low, 2), "high": round(high, 2), "last": round(last, 2),
+            "pct_in_range": round(pct) if pct is not None else None, "descriptor": desc}
+
+
 def _fmt_money(x):
     if not x:
         return "n/a"
@@ -1727,103 +2074,94 @@ def fetch_company_financials(ticker, as_of_date, info=None,
     return fin
 
 
-def compute_filings_fr_signal(ticker, as_of_date, lag_days=FINANCIALS_REPORTING_LAG_DAYS):
+def compute_fundamentals_signal(ticker, as_of_date):
     """
-    Deterministic Financial Risk signal from quarterly filings -- no news, no LLM. Measures
-    the net-debt (and, when EBITDA is available, net-leverage) trend across the quarters
-    on/before as_of_date. Rising net debt = credit-negative; a decline = credit-positive.
-    This complements the news channel and catches quiet balance-sheet moves that never make
-    headlines (the ADEA deleveraging / WBD zero-news blind spots); it also fires when the
-    news channel returns nothing. Returns a signal dict in the standard schema, or None when
-    the trend is immaterial or the data is insufficient. Best-effort; never raises.
+    Deterministic credit signal from the quarterly fundamentals trend (no news, no LLM),
+    built on compute_financial_panel(). Votes across revenue, EBITDA margin, free cash flow,
+    and net leverage:
+      - NEGATIVE fires when net leverage rises materially (a reliable warning on its own).
+      - POSITIVE requires BROAD corroboration (>=3 metrics improving, none deteriorating), so
+        a genuine turnaround (SNDK: revenue/margin/FCF up + deleveraging) scores, while a firm
+        that merely deleveraged into trouble (PSKY: leverage down but revenue/margin weak) does
+        not -- avoiding the false-positive that got positive filings signals disabled before.
+    Confidence = 0.60 + 0.05 x (agreeing metrics), capped. Returns a standard signal dict
+    (Financial Risk, source 'filings'), or None when the picture is mixed / data is thin.
+    Fires even at zero news coverage -- the fix for fundamentally strong but quiet names.
     """
-    try:
-        tk  = yf.Ticker(yf_symbol(ticker))
-        bs  = tk.quarterly_balance_sheet
-        isq = tk.quarterly_income_stmt
-    except Exception:  # noqa: BLE001
+    panel = compute_financial_panel(ticker, as_of_date)
+    if not panel:
         return None
-    if bs is None or getattr(bs, "empty", True):
-        return None
-    try:
-        cutoff = (datetime.datetime.strptime(as_of_date, "%Y-%m-%d")
-                  - datetime.timedelta(days=lag_days)).date()
-    except (ValueError, TypeError):
-        return None
+    by = {x["name"]: x for x in panel["metrics"]}
 
-    cols = sorted(c for c in bs.columns if c.to_pydatetime().date() <= cutoff)[-5:]
-    if len(cols) < 2:
-        return None
+    def nn(name):
+        return [v for v in by.get(name, {}).get("values", []) if v is not None]
 
-    net_debt = []
-    for c in cols:
-        debt = _cell(bs, "Total Debt", c)
-        cash = (_cell(bs, "Cash And Cash Equivalents", c)
-                or _cell(bs, "Cash Cash Equivalents And Short Term Investments", c))
-        net_debt.append(None if debt is None else debt - (cash or 0))
+    def chg(name):
+        return by.get(name, {}).get("change_pct")
 
-    pts = [(c, v) for c, v in zip(cols, net_debt) if v is not None]
-    if len(pts) < 2 or abs(pts[0][1]) < 1e-6:
-        return None
+    pos, neg = [], []
 
-    (_c_then, nd_then), (c_now, nd_now) = pts[0], pts[-1]
-    # Net-cash companies (net debt <= 0) have no leverage pressure -- a "rising net debt"
-    # on a negative base is meaningless and must not produce a credit-negative signal
-    # (e.g. Nvidia: net debt -$889M = net cash, was wrongly flagged DOWNGRADE WATCH).
-    if nd_now <= 0:
-        return None
-    pct = (nd_now - nd_then) / abs(nd_then)
-    if -FILINGS_FR_MIN_CHANGE < pct < FILINGS_FR_MIN_CHANGE:
-        return None  # immaterial trend -> stay silent rather than add noise
-    direction = "negative" if pct > 0 else "positive"
-    if FILINGS_FR_NEGATIVE_ONLY and direction == "positive":
-        return None  # deleveraging is weak/unreliable credit-positive evidence -> stay silent
+    rc = chg("Revenue")
+    if rc is not None and rc > 10:
+        pos.append(f"revenue {rc:+.0f}%")
+    elif rc is not None and rc < -10:
+        neg.append(f"revenue {rc:+.0f}%")
 
-    # Net-leverage context (TTM EBITDA), best-effort across differing yfinance labels.
-    leverage = None
-    try:
-        if isq is not None and not isq.empty:
-            icols = sorted(c for c in isq.columns if c.to_pydatetime().date() <= cutoff)[-4:]
-            ebitda = []
-            for c in icols:
-                e = (_cell(isq, "EBITDA", c) or _cell(isq, "Normalized EBITDA", c)
-                     or _cell(isq, "EBIT", c) or _cell(isq, "Operating Income", c))
-                if e is not None:
-                    ebitda.append(e)
-            ttm = sum(ebitda) if ebitda else None
-            if ttm and ttm > 0:
-                leverage = nd_now / ttm
-    except Exception:  # noqa: BLE001
-        leverage = None
+    em = nn("EBITDA margin")
+    if len(em) >= 2:
+        dpp = em[-1] - em[0]
+        if dpp > 2:
+            pos.append(f"EBITDA margin {dpp:+.0f}pp")
+        elif dpp < -2:
+            neg.append(f"EBITDA margin {dpp:+.0f}pp")
 
-    # Sanity guards -- for institutional use, no signal beats a wrong signal:
-    #  (a) implausible leverage => EBITDA data is patchy; drop the x-figure, keep direction.
-    if leverage is not None and (leverage < 0 or leverage > 25):
-        leverage = None
-    #  (b) a near-zero base quarter makes the % explode and meaningless; only trust it when
-    #      a plausible leverage level corroborates the move, else stay silent.
-    if abs(nd_then) < 0.10 * abs(nd_now) and leverage is None:
+    fc, fchg = nn("Free cash flow"), chg("Free cash flow")
+    if fc:
+        if fc[-1] > 0 and (fchg is None or fchg >= 0):
+            pos.append("FCF positive & rising")
+        elif fc[-1] < 0:
+            neg.append("FCF negative")
+
+    nd = nn("Net debt")
+    lev_up = False
+    if len(nd) >= 2:
+        nd_then, nd_now = nd[0], nd[-1]
+        if nd_now > 0 and (nd_now - nd_then) > 0.10 * abs(nd_then or 1):
+            neg.append("net leverage rising")
+            lev_up = True
+        elif nd_now < nd_then:
+            pos.append("net cash" if nd_now <= 0 else "net debt falling")
+
+    if lev_up:
+        direction, drivers = "negative", neg
+    elif len(pos) >= 3 and not neg:
+        direction, drivers = "positive", pos
+    else:
         return None
 
-    conf    = round(min(FILINGS_FR_MAX_CONF, 0.65 + min(0.25, abs(pct))), 3)
-    verb    = "rose" if pct > 0 else "fell"
-    lev_str = f"; net leverage {leverage:.1f}x" if leverage is not None else ""
-    figs    = [{"metric": "net debt", "value": _fmt_money(nd_now)}]
-    if leverage is not None:
-        figs.append({"metric": "net leverage", "value": f"{leverage:.1f}x"})
+    conf = round(min(0.80 if direction == "positive" else 0.85, 0.60 + 0.05 * len(drivers)), 3)
 
+    figs = []
+    for nm in ("Revenue", "EBITDA margin", "Free cash flow", "Net debt"):
+        v = nn(nm)
+        if v:
+            figs.append({"metric": nm.lower(),
+                         "value": (f"{v[-1]:.1f}%" if by[nm]["unit"] == "pct"
+                                   else _fmt_money(v[-1]))})
+
+    last_q = panel["quarters"][-1] if panel.get("quarters") else as_of_date
+    summary = (("Broad-based improvement" if direction == "positive" else "Deteriorating fundamentals")
+               + ": " + ", ".join(drivers) + f" (through {last_q}, filings)")
     return {
-        "date":          c_now.strftime("%Y-%m-%d"),
+        "date":          last_q,
         "direction":     direction,
         "confidence":    conf,
         "risk_category": "Financial Risk",
-        "sp_factor":     "Leverage trend (quarterly filings)",
-        "event_summary": (f"Net debt {verb} {abs(pct) * 100:.0f}% to {_fmt_money(nd_now)} "
-                          f"over {len(pts)} quarters (through {c_now.strftime('%Y-%m-%d')}, "
-                          f"filings){lev_str}"),
-        "rationale":     ("Rising net leverage pressures debt service and coverage"
-                          if direction == "negative"
-                          else "Deleveraging improves interest coverage and financial flexibility"),
+        "sp_factor":     "Fundamentals trend (quarterly filings)",
+        "event_summary": summary,
+        "rationale":     ("Broad, corroborated improvement in cash generation and leverage "
+                          "strengthens the credit profile" if direction == "positive"
+                          else "Rising net leverage pressures debt service and coverage"),
         "headline":      "Quarterly filings (Yahoo Finance)",
         "url":           "",
         "key_figures":   figs,
@@ -2122,6 +2460,15 @@ def print_end_date_snapshot(end_date, financials, market_ctx, agg_figures,
                   f"{ws} -> {we}; equity reaction, NOT bond repricing)")
         else:
             print(f"  Price          : {price_str}")
+
+        r52 = market_ctx.get("fiftytwo_week")
+        if r52 and r52.get("low") is not None:
+            pct  = r52.get("pct_in_range")
+            desc = r52.get("descriptor", "")
+            pos_str = f"{pct}% of range" if pct is not None else ""
+            extra   = "  ".join(x for x in (pos_str, desc) if x)
+            print(f"  52-wk range    : ${r52['low']:.2f} - ${r52['high']:.2f}   "
+                  f"(current ${r52['last']:.2f}{'  ->  ' + extra if extra else ''})")
     else:
         print("  Price          : market data unavailable")
 
@@ -2310,12 +2657,27 @@ def run_pipeline():
                            reverse=True)[:MAX_ARTICLES]
         print(f"  Capped to most-recent    : {len(news_data)}")
 
+    near_misses = []   # judged-but-below-bar candidates, shown when no news qualifies
+
     if USE_LLM_JUDGE:
-        # ── Phase 2: Cross-encoder relevance filter (S&P criteria = the anchor) ──
-        print(f"\n[Phase 2] Cross-encoder relevance filter ({len(news_data)} on-topic -> top {CROSSENCODER_TOP_N})...")
-        print("  Loading cross-encoder model...")
-        filtered = filter_with_crossencoder(news_data, criteria_texts, criteria_labels)
-        print(f"  Kept : {len(filtered)} articles (best match to S&P criteria)")
+        # ── Phase 2: relevance filter -- LLM triage (default) or cross-encoder (fallback) ──
+        if USE_LLM_TRIAGE and OPENROUTER_API_KEY:
+            print(f"\n[Phase 2] LLM credit-materiality triage ({len(news_data)} on-topic "
+                  f"-> keep score >= {TRIAGE_MIN_SCORE}, cap {TRIAGE_MAX_KEEP}) via {TRIAGE_MODEL}...")
+            ranked   = triage_articles(news_data, COMPANY_NAME,
+                                       target_sector["sector_name"], criteria_texts)
+            filtered = [a for a in ranked if a["_triage_score"] >= TRIAGE_MIN_SCORE][:TRIAGE_MAX_KEEP]
+            if not filtered:                       # triage failed/empty -> don't starve the judge
+                filtered = ranked[:TRIAGE_MAX_KEEP]
+                print("  [triage returned no scored articles -- falling back to most-recent feed]")
+            top_score = ranked[0]["_triage_score"] if ranked else 0
+            print(f"  Kept : {len(filtered)} articles (credit-materiality >= {TRIAGE_MIN_SCORE}; "
+                  f"top score {top_score:.0f}/10)")
+        else:
+            print(f"\n[Phase 2] Cross-encoder relevance filter ({len(news_data)} on-topic -> top {CROSSENCODER_TOP_N})...")
+            print("  Loading cross-encoder model...")
+            filtered = filter_with_crossencoder(news_data, criteria_texts, criteria_labels)
+            print(f"  Kept : {len(filtered)} articles (best match to S&P criteria)")
 
         # ── Phase 3: Scrape only the filtered articles ────────────
         print(f"\n[Phase 3] Scraping {len(filtered)} selected articles ({SCRAPE_WORKERS} threads)...")
@@ -2353,17 +2715,19 @@ def run_pipeline():
         if financials.get("total_debt") is not None or mcap:
             debt_ctx = (f"total debt {_fmt_money(financials.get('total_debt'))}, "
                         f"market cap {_fmt_money(mcap)} (as of {financials.get('as_of')})")
-        all_signals = run_judge_articles(fetched_articles, COMPANY_NAME,
-                                         target_sector["sector_name"], debt_ctx)
-        print(f"  Judged material : {len(all_signals)}")
+        all_signals, near_misses = run_judge_articles(fetched_articles, COMPANY_NAME,
+                                                       target_sector["sector_name"], debt_ctx)
+        print(f"  Judged material : {len(all_signals)}"
+              f"  ({len(near_misses)} reviewed but below the bar)")
 
         if USE_FINBERT and all_signals:
             print("\n[Phase 4b] FinBERT tone (second opinion)...")
             all_signals = add_finbert_tone(all_signals)
 
         # Clean internal scratch fields.
-        for s in all_signals:
+        for s in all_signals + near_misses:
             s.pop("_ce_score", None)
+            s.pop("_triage_score", None)
             s.pop("full_text", None)
 
         rank_key = "confidence"
@@ -2465,19 +2829,21 @@ def run_pipeline():
     # ── Phase 5c: deterministic Financial-Risk signal from quarterly filings ──
     # No news, no LLM -- fires even at zero news coverage; catches quiet leverage moves.
     if USE_LLM_JUDGE and USE_FILINGS_FR:
-        print("\n[Phase 5c] Filings Financial-Risk signal (quarterly leverage trend)...")
-        fr_sig = compute_filings_fr_signal(TICKER, END_DATE)
+        print("\n[Phase 5c] Fundamentals signal (quarterly revenue/margin/FCF/leverage trend)...")
+        fr_sig = compute_fundamentals_signal(TICKER, END_DATE)
         if fr_sig:
             top_signals.append(fr_sig)
-            print(f"  [filings FR] {fr_sig['direction']}: {fr_sig['event_summary']}")
+            print(f"  [fundamentals] {fr_sig['direction']}: {fr_sig['event_summary']}")
         else:
-            print("  [filings FR] no material leverage trend (or insufficient quarterly data)")
+            print("  [fundamentals] mixed/immaterial trend (or insufficient quarterly data)")
 
     # ── Market snapshot as of end date (summary-level, not per signal) ──
     market_ctx = None
-    if USE_MARKET_SNAPSHOT and USE_LLM_JUDGE and top_signals:
+    if USE_MARKET_SNAPSHOT and USE_LLM_JUDGE:
         print("\n[Phase 5b] Market snapshot as of end date...")
         market_ctx = compute_market_context(top_signals, TICKER, START_DATE, END_DATE)
+        if market_ctx:
+            market_ctx["fiftytwo_week"] = compute_52w_range(TICKER, END_DATE)
 
     # Point-in-time market cap = end-date price x shares outstanding (free, as-of-window).
     if market_ctx and market_ctx.get("last_close") and financials.get("shares_outstanding"):
@@ -2530,7 +2896,13 @@ def run_pipeline():
         financial_panel = compute_financial_panel(TICKER, END_DATE)
         print_financial_panel(financial_panel, TICKER, COMPANY_NAME)
 
-    print_news_digest(news_digest, encoder, show_equity=SHOW_EQUITY_NEWS)
+    # Always surface the developing / reviewed credit-relevant stories (context, not scored),
+    # so every run shows news even when nothing cleared the materiality bar.
+    if USE_LLM_JUDGE:
+        print_developing_news(near_misses, has_material=bool(all_signals))
+
+    print_news_digest(news_digest, encoder, company_name=COMPANY_NAME, ticker=TICKER,
+                      show_equity=SHOW_EQUITY_NEWS)
 
     output = {
         "ticker":            TICKER,
@@ -2562,6 +2934,7 @@ def run_pipeline():
         },
         "company_financials": financials if USE_LLM_JUDGE else None,
         "financial_panel":    financial_panel,
+        "developing_news":    developing_news_items(near_misses, 5) if USE_LLM_JUDGE else [],
         "market_context":     market_ctx,
         "key_figures_summary": agg_figures,
         "contradictions":     contradictions,

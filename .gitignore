@@ -37,3 +37,6 @@ memory/
 # Licensed / proprietary source data — never commit (S&P criteria PDFs, LSEG exports)
 *.pdf
 ratings_history.csv
+
+# Local news cache (GDELT responses)
+.cache/
