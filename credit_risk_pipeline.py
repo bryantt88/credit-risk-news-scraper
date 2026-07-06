@@ -124,7 +124,9 @@ END_DATE        = "2026-06-30"
 # to the full judge. Falls back to the cross-encoder if OpenRouter is unavailable.
 USE_LLM_TRIAGE      = True
 TRIAGE_MODEL        = "google/gemini-2.5-flash-lite"  # cheap OpenRouter model for triage
-TRIAGE_MIN_SCORE    = 5      # keep articles scoring >= this (0-10) for the judge
+TRIAGE_MIN_SCORE    = 4      # keep articles scoring >= this (0-10) for the judge
+                             # (4 = wider net; lets borderline credit-relevant stories reach
+                             #  the judge, esp. on thin-coverage names. Capped by TRIAGE_MAX_KEEP.)
 TRIAGE_MAX_KEEP     = 40     # hard cap forwarded to the judge (cost ceiling)
 TRIAGE_BATCH_SIZE   = 30     # articles scored per triage call
 
