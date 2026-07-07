@@ -6,60 +6,62 @@ Scans financial news and extracts events material to a company's S&P credit rati
 
 Architecture
 ------------
-Phase 1 -- Data Ingestion & Dynamic Routing
-    Fetches company news via Finnhub API. Maps Yahoo Finance industry to the
-    correct S&P sector using a curated override dictionary and word-overlap scoring.
+Phase 1 -- Ingestion, Routing & Entity Gate
+    Fetches news from Finnhub + GDELT (merged, de-duplicated by normalized headline).
+    Routes the issuer to the correct S&P sector with an LLM sector router (Yahoo
+    industry + business summary -> S&P sector; embedding/override fallback). An entity
+    gate drops articles that never name the issuer, before any expensive step.
 
-Phase 2 -- Cross-Encoder Relevance Filter (judge path)
-    Scores every article headline+summary against the sector's S&P criteria using
-    a cross-encoder model (cross-encoder/ms-marco-MiniLM-L6-v2). Unlike cosine
-    similarity, the cross-encoder reads both texts together and scores how well the
-    headline relates to the specific criterion -- much better signal-to-noise.
-    Only the top CROSSENCODER_TOP_N articles are carried forward; everything else
-    is discarded before any scraping happens.
+Phase 2 -- LLM Credit-Materiality Triage
+    A cheap LLM (TRIAGE_MODEL via OpenRouter) scores every on-topic article 0-10 for
+    credit materiality; articles scoring >= TRIAGE_MIN_SCORE are forwarded, capped at
+    TRIAGE_MAX_KEEP. Replaces the cross-encoder, which rewarded generic money-language
+    and buried real stories. Set USE_LLM_TRIAGE = False to fall back to the cross-encoder
+    (cross-encoder/ms-marco-MiniLM-L6-v2, top CROSSENCODER_TOP_N).
 
 Phase 3 -- Selective Full-Text Scraping
-    Downloads complete article text only for the articles that passed Phase 2.
-    Uses requests + newspaper3k with a hard 8-second timeout (bypasses newspaper's
-    own HTTP client which has no timeout and hangs on paywalls/slow CDNs).
+    Downloads full text only for the filtered articles: trafilatura -> newspaper3k ->
+    Finnhub summary fallback, with a hard timeout. Resolves Finnhub redirect URLs to the
+    real publisher page so stored links open correctly.
 
-Phase 4 -- Local-Claude Judge ("The Analyst")
-    The real relevance decision. Each filtered article is judged by the local Claude
-    Code CLI (claude -p, your subscription -- no API key): is this a material credit
-    event, good or bad for the bond, which S&P factor, and why. Claude receives the
-    full article text and the best-matching S&P criterion as context. Returns a clean
-    event_summary, direction, confidence, and rationale per article.
+Phase 4 -- The Judge ("The Analyst")
+    The real relevance decision. Each filtered article is judged against the sector's S&P
+    criteria: is this a material credit event, good or bad for the bond, which S&P factor,
+    and why. Returns event_summary, direction, confidence, rationale, and verbatim
+    key_figures (verify_figures drops any number not present in the source text). Backend
+    chosen at startup: OpenRouter (default, e.g. Haiku 4.5) or the local Claude Code CLI.
 
 Phase 4b -- FinBERT Tone (secondary signal only)
-    Runs FinBERT on the judge's event_summary to add a tone label (positive/negative/
-    neutral). Shown next to the judge's credit direction -- flags divergent cases where
-    upbeat-sounding news is actually bad for credit, or vice versa.
-    NOTE: Claude's credit direction (Phase 4) is the authoritative signal. FinBERT is a
-    lexical sentiment model with no understanding of credit context; it cannot distinguish
-    debt issuance (bad for bondholders, sounds routine) from genuine recovery. Use
-    tone_alignment = divergent as a prompt to re-read the article, not as a correction.
+    Adds a tone label on the judge's event_summary and flags tone_alignment = divergent.
+    NOTE: the judge's credit direction (Phase 4) is authoritative. FinBERT has no credit
+    context; it cannot distinguish debt issuance (bad for bondholders, sounds routine)
+    from genuine recovery. Treat divergence as a prompt to re-read, not a correction.
 
-Phase 5 -- Deduplication & Ranking
-    Removes near-duplicate signals from multiple outlets covering the same event.
-    Ranks by judge confidence and exports a structured JSON report.
+Phase 5 -- Event Dedup, Scoring & Report
+    Clusters same-event signals (reworded duplicates + cross-category splits) and
+    reconciles them to one vote per event; conflicting reads net out; outlet count feeds
+    a mild capped coverage weight. Computes a normalized [-1,+1] score with evidence
+    shrinkage n/(n+SCORE_SHRINKAGE_K), a 5-band verdict + conviction label, and a
+    bootstrap uncertainty band (>=4 signals). Also: market snapshot / priced-in check
+    (5b), deterministic fundamentals signal from filings (5c), always-on financial panel,
+    developing-news section, and a substance-ranked equity digest. Exports JSON.
 
 A/B switch: set USE_LLM_JUDGE = False to revert to the legacy cosine-only path
 (spaCy entity filter + bi-encoder paragraph scoring) for direct comparison.
 
 Usage
 -----
-    1. Set TICKER, COMPANY_NAME, and the date window in the CONFIGURATION block.
-    2. Set your Finnhub API key as an environment variable:
-           set FINNHUB_API_KEY=your_key_here        (Windows CMD)
-           $env:FINNHUB_API_KEY="your_key_here"     (PowerShell)
-    3. Run:  python credit_risk_pipeline.py
+    Interactive:  python credit_risk_pipeline.py   (prompts for ticker/dates/judge)
+    Batch:        python credit_risk_pipeline.py TICKER "Company" START END [JUDGE]
+    Validation:   python backtest_harness.py       (labelled cases -> scoreboard)
 
 Dependencies
 ------------
     pip install -r requirements.txt
-    python -m spacy download en_core_web_sm   # only needed for legacy path
-    # The judge (Phase 4) calls your local Claude Code CLI -- install it once via
-    #   irm https://claude.ai/install.ps1 | iex   (then run `claude` to log in)
+    # Keys (env or .env): FINNHUB_API_KEY, plus OPENROUTER_API_KEY for the default
+    #   triage + judge path. GDELT needs no key.
+    # Optional Claude CLI judge backend: irm https://claude.ai/install.ps1 | iex
+    # python -m spacy download en_core_web_sm   # only needed for the legacy cosine path
 """
 
 import os
