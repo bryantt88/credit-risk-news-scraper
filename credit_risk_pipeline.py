@@ -240,7 +240,8 @@ MIN_JUDGE_CONFIDENCE = 0.65  # was 0.72; 0.65 keeps the credit signal rigorous, 
 # calls (also saves quota). Keyed by company + article + criterion + judge model + prompt version.
 # Bump _JUDGE_PROMPT_VERSION to invalidate every cached verdict after a prompt/rubric change.
 VERDICT_CACHE         = True
-_JUDGE_PROMPT_VERSION = "v1"
+_JUDGE_PROMPT_VERSION = "v2"   # v2: materiality gated on mapping to an S&P rating factor
+                               # (drops lawsuits/activist/governance noise). Bumping invalidates v1.
 
 # --- Recall-recovery loop (Phases 2-4) ---
 # The single-pass pipeline scored blank on quiet issuers (the backtest's upgrade-side misses
@@ -1243,7 +1244,18 @@ _JUDGE_RUBRIC = (
     "Decide whether this NEWS ARTICLE describes a MATERIAL credit-rating event for the "
     "TARGET COMPANY, judged against the S&P sector criterion provided.\n"
     "\n"
+    "MATERIALITY IS DECIDED BY THE S&P CRITERIA. An event is material ONLY if it plausibly "
+    "moves one of the S&P sector rating factors in the MATCHED S&P CRITERION above -- e.g. "
+    "leverage, cash flow, liquidity, refinancing/debt maturities, margins, competitive/market "
+    "position, or capex intensity. Name that exact factor in 'sp_factor'. If the news does not "
+    "map to a listed S&P rating factor, it is NOT material.\n"
+    "\n"
     "STRICT MATERIALITY RULES -- set material=false if ANY of these apply:\n"
+    "  - The news maps to NO S&P rating factor from the criterion above\n"
+    "  - It is a lawsuit/litigation, activist-investor push, governance/board or management "
+    "dispute, executive change, or stock-price/analyst commentary -- UNLESS the article states "
+    "a concrete, quantified hit to leverage, liquidity, or cash flow (a fine/settlement large "
+    "enough to move the balance sheet counts; reputational/legal risk alone does not)\n"
     "  - Company is only mentioned in passing or alongside many other companies\n"
     "  - Article is generic market/macro commentary with no company-specific figures\n"
     "  - Industry-wide policy change (tariffs, regulations) with no quantified impact "
