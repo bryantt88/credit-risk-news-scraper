@@ -82,6 +82,10 @@ import datetime
 import time
 import torch
 
+# Script directory. Resolve data/output paths against this, NOT the current working
+# directory, so the pipeline works when launched from anywhere (IDE, cron, another cwd).
+HERE = Path(__file__).resolve().parent
+
 
 def _load_dotenv():
     """
@@ -130,7 +134,8 @@ TRIAGE_MIN_SCORE    = 4      # keep articles scoring >= this (0-10) for the judg
                              # (4 = wider net; lets borderline credit-relevant stories reach
                              #  the judge, esp. on thin-coverage names. Capped by TRIAGE_MAX_KEEP.)
 TRIAGE_MAX_KEEP     = 40     # hard cap forwarded to the judge (cost ceiling)
-TRIAGE_BATCH_SIZE   = 30     # articles scored per triage call
+TRIAGE_BATCH_SIZE   = 60     # articles scored per triage call (headline+short summary each, so
+                             # a big batch fits easily; halves triage calls on high-volume names)
 
 CROSSENCODER_MODEL  = "cross-encoder/ms-marco-MiniLM-L6-v2"
 CROSSENCODER_TOP_N  = 40    # articles forwarded to Claude after CE filter (fallback path)
@@ -158,7 +163,10 @@ EVENT_CLUSTER_SIM   = 0.50   # event_summary cosine >= this (within the day wind
 EVENT_CLUSTER_DAYS  = 3      # only merge same-event reads dated within N days of each other
 COVERAGE_WEIGHT_K   = 0.25   # coverage multiplier w = 1 + K*ln(outlets); 5 outlets ~ x1.40 (mild)
 COVERAGE_WEIGHT_MAX = 1.75   # cap so one viral story cannot dominate the score
-SCRAPE_WORKERS          = 15    # parallel threads for HTTP scraping
+SCRAPE_WORKERS          = 8     # parallel threads for HTTP scraping. Lowered 15->8: trafilatura/
+                                # newspaper both parse HTML via lxml, and heavy concurrent lxml
+                                # parsing can SEGFAULT (native crash, uncatchable in Python). Fewer
+                                # threads cuts that risk; the harness retry covers the rare case.
 MAX_ARTICLES            = 300   # cap on Finnhub articles fetched; None = no cap
 
 # --- Supplementary news sources (free, no API key), merged with the Finnhub feed ---
@@ -173,6 +181,14 @@ GDELT_MAX       = 100   # cap on GDELT items pulled per run (API max 250)
 GOOGLE_NEWS_MAX = 100   # cap on Google News items pulled per run
 GDELT_CACHE_TTL = 43200 # seconds (12h) to reuse a cached GDELT response for the same
                         # ticker+window, so repeated runs don't re-hit GDELT's 1-req/5s limit
+# GDELT returns at most 250 records PER request, but covers 2017->present with no total cap.
+# Finnhub, by contrast, caps at 250 and refuses windows older than ~1 year. So for long or
+# historical windows we slice the date range into GDELT_CHUNK_DAYS sub-windows and fetch each
+# (250 each), merging -- far more than 250, evenly spread, as far back as needed. GDELT throttles
+# to ~1 req/5s, so each extra slice adds ~5s; GDELT_TOTAL_MAX caps the merged result.
+GDELT_PAGINATE   = True
+GDELT_CHUNK_DAYS = 30   # slice size; a window longer than this is fetched in multiple requests
+GDELT_TOTAL_MAX  = 300  # overall cap on merged GDELT items across all slices (runaway guard)
 
 # --- Bootstrap uncertainty band (Phase 5 scoring) ---
 BOOTSTRAP_RESAMPLES     = 1000  # resamples of the signal set for the score band
@@ -206,15 +222,57 @@ FINANCIAL_PANEL_QUARTERS = 4     # number of recent quarters shown side by side
 FINANCIALS_REPORTING_LAG_DAYS = 0
 
 # --- LLM judge (Phase 4) ---
-# The judge can run through two backends, chosen at runtime:
+# The judge can run through three backends, chosen at runtime:
 #   "claude"     -> local Claude Code CLI (claude -p); uses your subscription allowance
 #   "openrouter" -> OpenRouter HTTP API (pay-per-token); key from OPENROUTER_API_KEY
+#   "gemini"     -> local Gemini CLI (gemini -m); $0 marginal cost on the user's OAuth
+#                   Google quota (no API key). Also serves triage + routing on this path,
+#                   so a gemini run needs no OPENROUTER_API_KEY at all. See _gemini_chat.
 USE_LLM_JUDGE        = True
 JUDGE_BACKEND        = "claude"   # set interactively at startup
 JUDGE_MODEL          = "haiku"    # meaning depends on backend (CLI alias or OpenRouter slug)
 JUDGE_WORKERS        = 6    # raised 4->6 to keep latency flat with TOP_N at 40
 JUDGE_TIMEOUT        = 120
 MIN_JUDGE_CONFIDENCE = 0.65  # was 0.72; 0.65 keeps the credit signal rigorous, slightly more inclusive
+
+# Verdict cache -- the reliability lever. Each article's judge verdict is persisted, so re-running
+# the same issuer/window reuses prior judgments: IDENTICAL output run-to-run AND no repeat LLM
+# calls (also saves quota). Keyed by company + article + criterion + judge model + prompt version.
+# Bump _JUDGE_PROMPT_VERSION to invalidate every cached verdict after a prompt/rubric change.
+VERDICT_CACHE         = True
+_JUDGE_PROMPT_VERSION = "v1"
+
+# --- Recall-recovery loop (Phases 2-4) ---
+# The single-pass pipeline scored blank on quiet issuers (the backtest's upgrade-side misses
+# were all thin-signal: CQP n=0, MOG.A/WBD n=1, RBLX/LADR n=2). When the judge returns fewer
+# than LOOP_MIN_MATERIAL material signals, re-search the news feed with expanded credit-risk
+# terms and judge ONLY the newly found articles, up to LOOP_MAX_ROUNDS extra rounds. This is a
+# general RECALL improvement (find more real news), not tuning toward any backtest label.
+# Stops early when a round adds nothing new, so a genuinely quiet name doesn't loop forever.
+USE_RECALL_LOOP     = True
+LOOP_MIN_MATERIAL   = 4      # loop while material-signal count < this
+LOOP_MAX_ROUNDS     = 2      # extra search+judge rounds after the first pass
+LOOP_RELAX_TRIAGE   = 3      # from round 2 on, admit triage score >= this (vs TRIAGE_MIN_SCORE)
+
+# --- Adversarial verification (Phase 4c) ---
+# Precision guard for the loop: after signals are gathered, a skeptic pass asks the judge to
+# REFUTE the credit-materiality of each material signal. Signals that fail the challenge are
+# demoted to near-misses rather than scored. Keeps the wider recall net from admitting noise.
+USE_ADVERSARIAL_VERIFY = False   # DISABLED: the skeptic pass proved volatile (demoted 4 signals
+                                 # one run, 0 the next -> score swung 0.15) and it fought the recall
+                                 # loop by dropping signals it had just found. The judge's 0.65
+                                 # confidence bar is the precision gate. Matches the earlier finding
+                                 # that a down-biasing self-critique hurt more than it helped.
+
+# Broad credit-risk vocabulary for the recall loop's expanded news search (OR-joined with the
+# company name). General bondholder-relevant terms; sector-specific terms are mined separately
+# from the routed sector's S&P risk prose (see _sector_search_terms).
+CREDIT_RISK_SEARCH_TERMS = [
+    "credit rating", "downgrade", "upgrade", "outlook", "creditwatch",
+    "refinancing", "debt maturity", "covenant", "leverage", "liquidity",
+    "restructuring", "default", "bond", "notes offering", "cash flow",
+    "guidance", "impairment", "acquisition", "dividend", "buyback",
+]
 
 # --- Sector routing ---
 # Ask the judge LLM to map the Yahoo Finance industry (+ business summary) to the single
@@ -247,11 +305,35 @@ JUDGE_CHOICES = [
     ("DeepSeek V3.1     -- OpenRouter, ~$0.011/issuer",               "openrouter", "deepseek/deepseek-chat-v3.1"),
     ("Gemini 2.5 Flash-Lite -- OpenRouter, ~$0.005/issuer",          "openrouter", "google/gemini-2.5-flash-lite"),
     ("GPT-4o-mini       -- OpenRouter, ~$0.008/issuer",              "openrouter", "openai/gpt-4o-mini"),
+    ("Gemini 2.5 Pro    -- local CLI, $0 (OAuth quota; needs gemini CLI + GOOGLE_CLOUD_PROJECT)",
+                                                                     "gemini",     "gemini-2.5-pro"),
 ]
 
 # --- OpenRouter API (used when JUDGE_BACKEND == "openrouter") ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+
+# --- Gemini CLI ($0 backend; used when JUDGE_BACKEND == "gemini") ---
+# Inference runs on the user's OAuth Google login via the gemini CLI subprocess (no API key,
+# no per-token bill -- quota/rate-limited). Judge uses GEMINI_JUDGE_MODEL; the cheaper
+# triage/routing calls use GEMINI_TRIAGE_MODEL. See memory: gemini-cli-zero-cost-backend.
+GEMINI_JUDGE_MODEL  = "gemini-2.5-pro"     # carried via JUDGE_MODEL when the CLI entry is chosen
+GEMINI_TRIAGE_MODEL = "gemini-2.5-flash"   # cheaper/faster model for triage + sector routing
+GEMINI_TIMEOUT      = 240                  # per-call subprocess timeout (s). Bounds a hung npm-shim
+                                           # call to 4 min (was 600 = 10 min, a per-issuer time bomb);
+                                           # measured Pro calls run ~30s, tail ~150s, so 240s is safe.
+GEMINI_MAX_WORKERS  = 4                    # cap parallel gemini subprocesses (quota/rate friendly)
+GEMINI_MAX_RETRIES  = 4                    # extra attempts on rate-limit/quota (429/RESOURCE_EXHAUSTED)
+GEMINI_BACKOFF_BASE = 8                    # backoff seconds; wait = BASE * 2**attempt (8,16,32,64)
+# Gemini is capped on NUMBER of requests, not tokens, so we pack many items per call. The judge
+# (1 call/article) and adversarial verify (1 call/signal) are the big consumers -- batching them
+# cuts per-issuer calls ~4-6x. Batch sizes are a quota-vs-per-item-attention trade; keep modest.
+GEMINI_JUDGE_BATCH  = 3                    # articles judged per Gemini call (1 = per-article).
+                                           # A/B tested on WBD: batch=3 keeps judge confidence
+                                           # decisive (~0.95, finds all material signals) while
+                                           # cutting calls ~3x; batch=8 collapsed confidence to
+                                           # ~0.57 and MISSED material signals -- do NOT raise it.
+GEMINI_VERIFY_BATCH = 12                   # signals challenged per adversarial-verify Gemini call
 
 # --- Evidence shrinkage for the credit score ---
 # score = raw_score x n/(n+K). Pulls the score toward 0 when it rests on few signals,
@@ -493,9 +575,13 @@ def match_sp_sector_llm(company_name, industry, business_summary, sp_criteria_ma
     sectors = sp_criteria_master["sectors"]
     names   = [s["sector_name"] for s in sectors]
     prompt  = build_sector_routing_prompt(company_name, industry, business_summary, names)
-    call    = _judge_via_openrouter if JUDGE_BACKEND == "openrouter" else _judge_via_claude_cli
     try:
-        verdict = call(prompt)
+        if JUDGE_BACKEND == "gemini":
+            # Sector routing is a light judgment -- run it on Flash (loose quota), not the
+            # quota-scarce 2.5-Pro judge model.
+            verdict = _extract_json_obj(_gemini_chat(prompt, GEMINI_TRIAGE_MODEL))
+        else:
+            verdict = _judge_call_fn()(prompt)
     except Exception:  # noqa: BLE001
         return None
     if not isinstance(verdict, dict):
@@ -644,16 +730,76 @@ def _core_company_name(company_name):
     return " ".join(core) or (company_name or "").strip()
 
 
-def _gdelt_cache_path(ticker, start_date, end_date):
+def _sector_search_terms(sector, limit=6):
+    """Short, searchable credit terms mined from a routed sector's dense S&P risk prose.
+    The JSON stores long analyst sentences (not query terms), so we pull the credit-loaded
+    phrases and acronyms actually present in THIS sector's business+financial risk text
+    (e.g. 'working capital', 'FOCF', 'leverage') to flavour the recall search by sector."""
+    text = " ".join((sector.get("business_risk_keywords", []) or [])
+                    + (sector.get("financial_risk_keywords", []) or []))
+    low  = text.lower()
+    terms = []
+    for m in re.findall(r"\b[A-Z]{2,5}\b", text):        # acronyms: FOCF, FFO, EBITDA, OEM, R&D
+        if m not in terms:
+            terms.append(m)
+    lexicon = ["working capital", "free operating cash flow", "free cash flow",
+               "operating cash flow", "capital expenditure", "leverage", "liquidity",
+               "margin", "refinancing", "covenant", "supply chain", "demand", "pricing",
+               "capacity", "tariff", "impairment", "hedge", "reserves", "backlog"]
+    for t in lexicon:
+        if t in low and t not in terms:
+            terms.append(t)
+    return terms[:limit]
+
+
+def build_recall_query(company_name, sector, round_idx):
+    """GDELT query terms for a recall-loop round: the broad credit vocabulary plus this
+    sector's mined terms. round_idx widens the net (round 1 = core credit terms; round 2+
+    adds the sector-specific terms). Returned as a list; fetch_gdelt_news OR-joins them."""
+    terms = list(CREDIT_RISK_SEARCH_TERMS)
+    if round_idx >= 2:
+        terms += _sector_search_terms(sector)
+    seen, out = set(), []
+    for t in terms:                                      # de-dup, preserve order
+        k = t.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out
+
+
+def _gdelt_cache_path(ticker, start_date, end_date, tag=""):
     d = Path(__file__).resolve().parent / ".cache"
     try:
         d.mkdir(exist_ok=True)
     except Exception:  # noqa: BLE001
         pass
-    return d / f"gdelt_{ticker}_{start_date}_{end_date}.json"
+    suffix = f"_{tag}" if tag else ""
+    return d / f"gdelt_{ticker}_{start_date}_{end_date}{suffix}.json"
 
 
-def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT_MAX):
+def _date_chunks(start_date, end_date, days):
+    """Split an inclusive [start, end] range (YYYY-MM-DD) into consecutive sub-windows of at
+    most `days` days each, newest-first. Lets GDELT be paged past its 250-records/request cap
+    and back beyond Finnhub's ~1-year horizon. Falls back to one window on a parse error."""
+    fmt = "%Y-%m-%d"
+    try:
+        s = datetime.datetime.strptime(start_date, fmt).date()
+        e = datetime.datetime.strptime(end_date, fmt).date()
+    except ValueError:
+        return [(start_date, end_date)]
+    if e < s or days < 1:
+        return [(start_date, end_date)]
+    chunks, cur_end, one = [], e, datetime.timedelta(days=1)
+    while cur_end >= s:
+        cur_start = max(s, cur_end - datetime.timedelta(days=days - 1))
+        chunks.append((cur_start.strftime(fmt), cur_end.strftime(fmt)))
+        cur_end = cur_start - one
+    return chunks
+
+
+def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT_MAX,
+                     extra_terms=None):
     """
     Supplementary free news via the GDELT DOC 2.0 API (no API key). Returns Finnhub-shaped
     dicts with REAL publisher URLs (unlike Google News' base64 redirects), so the judge can
@@ -663,66 +809,106 @@ def fetch_gdelt_news(company_name, ticker, start_date, end_date, max_items=GDELT
     Searches the CORE company name (suffixes stripped) to match how articles refer to the
     issuer, and caches successful responses per ticker+window (GDELT_CACHE_TTL) so repeated
     runs don't re-hit GDELT's strict 1-request/5s limit. Best-effort: returns [] on failure.
+
+    extra_terms (recall loop): a list of credit-risk terms OR-joined into the query to surface
+    credit-relevant stories the plain-name search missed. Cached under a separate terms-hashed
+    key so an expanded query never collides with (or overwrites) the base-name cache.
     """
     from urllib.parse import quote
 
+    # Terms-aware cache tag: base search and each expanded search cache independently.
+    tag = ""
+    if extra_terms:
+        import hashlib
+        digest = hashlib.md5("|".join(sorted(extra_terms)).encode("utf-8")).hexdigest()[:8]
+        tag = f"x{digest}"
+
+    # When paginating, the merged result can far exceed the old per-request cap; total_cap is the
+    # ceiling across all slices (and the slice we serve from cache), so it must gate cache-serve.
+    total_cap = GDELT_TOTAL_MAX if GDELT_PAGINATE else max_items
+
     # Serve from cache when fresh -- avoids re-hitting the rate limit on repeated runs.
-    cache = _gdelt_cache_path(ticker, start_date, end_date)
+    cache = _gdelt_cache_path(ticker, start_date, end_date, tag=tag)
     try:
         if cache.exists() and (time.time() - cache.stat().st_mtime) < GDELT_CACHE_TTL:
             cached = json.loads(cache.read_text(encoding="utf-8"))
             if cached:
-                return cached[:max_items]
+                for a in cached:                 # backfill tag for caches written before it existed
+                    a.setdefault("provider", "gdelt")
+                return cached[:total_cap]
     except Exception:  # noqa: BLE001
         pass
 
     def _stamp(d, tail):
         return d.replace("-", "") + tail
 
-    query = f'"{_core_company_name(company_name)}" sourcelang:english'
-    url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + quote(query)
-           + "&mode=ArtList&format=json&sort=DateDesc"
-           + f"&maxrecords={min(250, max_items)}"
-           + f"&startdatetime={_stamp(start_date, '000000')}"
-           + f"&enddatetime={_stamp(end_date, '235959')}")
-    # GDELT rate-limits to ~1 request / 5s; retry once after a pause on HTTP 429.
-    arts = []
-    for attempt in (1, 2):
-        try:
-            r = requests.get(url, timeout=20, headers=_SCRAPE_HEADERS)
-            if r.status_code == 429:
-                if attempt == 1:
-                    time.sleep(5)
-                    continue
-                return []
-            r.raise_for_status()
-            arts = r.json().get("articles", []) or []
-            break
-        except Exception:  # noqa: BLE001
-            if attempt == 2:
-                return []
-            time.sleep(5)
+    core = _core_company_name(company_name)
+    if extra_terms:
+        # OR-group the credit terms; quote multi-word phrases so GDELT treats them atomically.
+        ors   = " OR ".join(f'"{t}"' if " " in t else t for t in extra_terms)
+        query = f'"{core}" ({ors}) sourcelang:english'
+    else:
+        query = f'"{core}" sourcelang:english'
 
+    def _fetch_window(s_date, e_date, per_max):
+        """One GDELT request for a single date sub-window -> Finnhub-shaped dicts (or [])."""
+        url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + quote(query)
+               + "&mode=ArtList&format=json&sort=DateDesc"
+               + f"&maxrecords={min(250, max(1, per_max))}"
+               + f"&startdatetime={_stamp(s_date, '000000')}"
+               + f"&enddatetime={_stamp(e_date, '235959')}")
+        arts = []
+        for attempt in (1, 2):   # GDELT ~1 req/5s; retry once after a pause on HTTP 429
+            try:
+                r = requests.get(url, timeout=20, headers=_SCRAPE_HEADERS)
+                if r.status_code == 429:
+                    if attempt == 1:
+                        time.sleep(5)
+                        continue
+                    return []
+                r.raise_for_status()
+                arts = r.json().get("articles", []) or []
+                break
+            except Exception:  # noqa: BLE001
+                if attempt == 2:
+                    return []
+                time.sleep(5)
+        window = []
+        for a in arts:
+            title = (a.get("title") or "").strip()
+            link  = (a.get("url") or "").strip()
+            if not title or not link:
+                continue
+            sd = (a.get("seendate") or "").replace("T", "").replace("Z", "")
+            try:
+                epoch = int(datetime.datetime.strptime(sd[:14], "%Y%m%d%H%M%S").timestamp())
+            except Exception:  # noqa: BLE001
+                epoch = 0
+            window.append({
+                "headline": title,
+                "summary":  title,          # GDELT has no snippet; title doubles as summary
+                "url":      link,
+                "datetime": epoch,
+                "source":   a.get("domain", "") or "GDELT",
+                "provider": "gdelt",        # query-scoped to the company phrase -> trust in the gate
+            })
+        return window
+
+    # Slice the window when it spans more than one chunk (breaks the 250/request ceiling and
+    # reaches back years); otherwise a single request. Sleep 5s between slices for the rate limit.
+    chunks = (_date_chunks(start_date, end_date, GDELT_CHUNK_DAYS)
+              if GDELT_PAGINATE else [(start_date, end_date)])
     out = []
-    for a in arts:
-        title = (a.get("title") or "").strip()
-        link  = (a.get("url") or "").strip()
-        if not title or not link:
-            continue
-        sd = (a.get("seendate") or "").replace("T", "").replace("Z", "")
-        try:
-            epoch = int(datetime.datetime.strptime(sd[:14], "%Y%m%d%H%M%S").timestamp())
-        except Exception:  # noqa: BLE001
-            epoch = 0
-        out.append({
-            "headline": title,
-            "summary":  title,          # GDELT has no snippet; title doubles as summary
-            "url":      link,
-            "datetime": epoch,
-            "source":   a.get("domain", "") or "GDELT",
-        })
-        if len(out) >= max_items:
+    for i, (cs, ce) in enumerate(chunks):
+        if len(out) >= total_cap:
             break
+        if i > 0:
+            time.sleep(5)                        # respect GDELT's ~1 req/5s limit between slices
+        got = _fetch_window(cs, ce, total_cap - len(out))
+        out = merge_news(out, got)
+        if i > 0 and not got:                    # older slice empty -> no more history; stop early
+            break
+    out = out[:total_cap]
 
     if out:  # cache only successful (non-empty) fetches so a throttled run retries next time
         try:
@@ -837,6 +1023,42 @@ def build_triage_prompt(company, sector_name, sector_factors, batch):
     )
 
 
+def _triage_model_id():
+    return GEMINI_TRIAGE_MODEL if JUDGE_BACKEND == "gemini" else TRIAGE_MODEL
+
+
+def _triage_key(company, sector_name, article):
+    """Cache key for one article's triage score (everything the score depends on)."""
+    import hashlib
+    raw = "|".join([company or "", sector_name or "", article.get("url", "") or "",
+                    article.get("headline", "") or "", _triage_model_id(), _JUDGE_PROMPT_VERSION])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _load_cached_triage(company, sector_name, article):
+    if not VERDICT_CACHE:
+        return None
+    p = HERE / ".cache" / "triage" / f"{_triage_key(company, sector_name, article)}.json"
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8")).get("s")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _save_triage(company, sector_name, article, score):
+    if not VERDICT_CACHE:
+        return
+    d = HERE / ".cache" / "triage"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{_triage_key(company, sector_name, article)}.json").write_text(
+            json.dumps({"s": score}), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def triage_articles(articles, company, sector_name, criteria_texts):
     """
     Cheap-LLM relevance triage (replaces the cross-encoder). Scores every on-topic article
@@ -844,44 +1066,71 @@ def triage_articles(articles, company, sector_name, criteria_texts):
     annotated with `_triage_score`, sorted high-to-low. Each article is handed the FULL set
     of sector criteria as its judge anchor (the judge decides the final risk_category itself).
 
-    Unlike the cross-encoder -- which matched surface money-language and ignored credit
-    causality -- the LLM understands that "debt-funded $135B capex" is a leverage event.
+    Triage scores are cached per article (VERDICT_CACHE): the same article always gets the same
+    score, so the top-N selection is reproducible run-to-run -- which, with the verdict cache,
+    makes a re-run of the same issuer deterministic. Only uncached articles hit the LLM.
     """
     sector_factors = "\n".join(f"- {c}" for c in criteria_texts)
     all_criteria   = "\n".join(criteria_texts)
-    batches = [articles[i:i + TRIAGE_BATCH_SIZE]
-               for i in range(0, len(articles), TRIAGE_BATCH_SIZE)]
 
-    def run_batch(indexed_batch):
-        bi, batch = indexed_batch
-        prompt = build_triage_prompt(company, sector_name, sector_factors, batch)
-        try:
-            content = _openrouter_chat(prompt, TRIAGE_MODEL, max_tokens=1200)
-            obj     = _extract_json_obj(content) or {}
-            local   = {}
-            for e in obj.get("scores", []):
-                try:
-                    local[int(e["id"])] = max(0.0, min(10.0, float(e["s"])))
-                except (KeyError, TypeError, ValueError):
-                    continue
-            return bi, local
-        except Exception as exc:  # noqa: BLE001
-            print(f"    [triage batch {bi} skipped] {str(exc).splitlines()[0][:100]}")
-            return bi, {}
+    # Split into cached (reuse score) vs uncached (need an LLM score).
+    scores   = {}            # index in `articles` -> triage score
+    to_score = []            # [(orig_index, article), ...]
+    for i, a in enumerate(articles):
+        s = _load_cached_triage(company, sector_name, a)
+        if s is not None:
+            scores[i] = s
+        else:
+            to_score.append((i, a))
 
-    with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
-        results = list(pool.map(run_batch, list(enumerate(batches))))
+    if to_score:
+        items   = [a for _, a in to_score]
+        batches = [items[j:j + TRIAGE_BATCH_SIZE] for j in range(0, len(items), TRIAGE_BATCH_SIZE)]
+
+        def run_batch(indexed_batch):
+            bi, batch = indexed_batch
+            prompt = build_triage_prompt(company, sector_name, sector_factors, batch)
+            try:
+                if JUDGE_BACKEND == "gemini":
+                    content = _gemini_chat(prompt, GEMINI_TRIAGE_MODEL)
+                else:
+                    content = _openrouter_chat(prompt, TRIAGE_MODEL, max_tokens=1200)
+                obj   = _extract_json_obj(content) or {}
+                local = {}
+                for e in obj.get("scores", []):
+                    try:
+                        local[int(e["id"])] = max(0.0, min(10.0, float(e["s"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                return bi, local
+            except Exception as exc:  # noqa: BLE001
+                print(f"    [triage batch {bi} skipped] {str(exc).splitlines()[0][:100]}")
+                return bi, {}
+
+        with ThreadPoolExecutor(max_workers=_judge_workers()) as pool:
+            results = list(pool.map(run_batch, list(enumerate(batches))))
+
+        for bi, local in results:
+            for local_idx, article in enumerate(batches[bi]):
+                score = local.get(local_idx, 0.0)
+                orig_index = to_score[bi * TRIAGE_BATCH_SIZE + local_idx][0]
+                scores[orig_index] = score
+                _save_triage(company, sector_name, article, score)
+
+    if scores and to_score:
+        print(f"  Triage cache: {len(scores) - len(to_score)} reused, {len(to_score)} scored fresh")
 
     scored = []
-    for bi, local in results:
-        for idx, article in enumerate(batches[bi]):
-            a = dict(article)
-            a["_triage_score"]    = local.get(idx, 0.0)
-            a["matched_criterion"] = all_criteria    # judge anchor (was single CE best-match)
-            a["risk_category"]     = "Business Risk"  # placeholder; the judge overwrites this
-            scored.append(a)
+    for i, article in enumerate(articles):
+        a = dict(article)
+        a["_triage_score"]     = scores.get(i, 0.0)
+        a["matched_criterion"] = all_criteria     # judge anchor (was single CE best-match)
+        a["risk_category"]     = "Business Risk"   # placeholder; the judge overwrites this
+        scored.append(a)
 
-    scored.sort(key=lambda x: x["_triage_score"], reverse=True)
+    # Deterministic order: score desc, then headline -- so equal-score ties never reshuffle the
+    # top-N cutoff between runs (another run-to-run variance source, now removed).
+    scored.sort(key=lambda x: (-x["_triage_score"], x.get("headline", "")))
     return scored
 
 
@@ -989,7 +1238,7 @@ def is_primary_subject(paragraph, company_name, doc):
 # PHASE 4 HELPERS: LOCAL-CLAUDE JUDGE
 # ==========================================
 
-_JUDGE_INSTRUCTIONS = (
+_JUDGE_RUBRIC = (
     "You are a senior S&P credit analyst assessing BONDHOLDER risk, NOT equity upside. "
     "Decide whether this NEWS ARTICLE describes a MATERIAL credit-rating event for the "
     "TARGET COMPANY, judged against the S&P sector criterion provided.\n"
@@ -1043,15 +1292,23 @@ _JUDGE_INSTRUCTIONS = (
     "amounts, percentages, ratios). Each is a short {\"metric\", \"value\"} pair using ONLY "
     "numbers present in the text -- never invent or round. Put NO quotation marks inside "
     "metric or value. Use an empty list [] if the article states none.\n"
-    "\n"
-    "Respond with ONLY a compact single-line JSON object -- no preamble, no markdown fences, "
-    "no newlines inside the JSON:\n"
+)
+
+# Per-article verdict schema (shared by the single and batched judge prompts).
+_JUDGE_VERDICT_SCHEMA = (
     '{"material": true/false, "risk_category": "Business Risk|Financial Risk|Neither", '
     '"sp_factor": "<short factor label>", "direction": "positive|negative|neutral", '
     '"confidence": 0.0-1.0, '
     '"key_figures": [{"metric": "<short label>", "value": "<number as written>"}], '
     '"event_summary": "<one concise sentence>", '
     '"rationale": "<one concise sentence>"}'
+)
+
+_JUDGE_INSTRUCTIONS = (
+    _JUDGE_RUBRIC
+    + "\nRespond with ONLY a compact single-line JSON object -- no preamble, no markdown "
+      "fences, no newlines inside the JSON:\n"
+    + _JUDGE_VERDICT_SCHEMA
 )
 
 
@@ -1089,6 +1346,33 @@ def build_judge_prompt(company, sector_name, matched_criterion, headline, articl
         f"MATCHED S&P CRITERION:\n{matched_criterion}\n\n"
         f"NEWS HEADLINE: {headline}\n"
         f"FULL ARTICLE:\n{article_text[:MAX_ARTICLE_CHARS]}"
+    )
+
+
+def build_batch_judge_prompt(company, sector_name, debt_context, batch):
+    """Judge MANY articles in a single call -- request-efficient for the rate-limited Gemini
+    backend (one call for GEMINI_JUDGE_BATCH articles instead of one each). Same rubric as the
+    single-article judge; returns a JSON array of verdicts keyed by article id."""
+    debt = f"COMPANY DEBT CONTEXT: {debt_context}\n" if debt_context else ""
+    blocks = []
+    for i, a in enumerate(batch):
+        blocks.append(
+            f"--- ARTICLE id={i} ---\n"
+            f"MATCHED S&P CRITERION: {a.get('matched_criterion', '')}\n"
+            f"HEADLINE: {a.get('headline', '')}\n"
+            f"ARTICLE:\n{(a.get('full_text', '') or '')[:MAX_ARTICLE_CHARS]}"
+        )
+    return (
+        f"{_JUDGE_RUBRIC}\n"
+        f"TARGET COMPANY: {company}\n"
+        f"S&P SECTOR: {sector_name}\n"
+        f"{debt}\n"
+        f"Judge the {len(batch)} articles below INDEPENDENTLY -- apply every rule to EACH, and do "
+        f"not let one article's verdict influence another.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nRespond with ONLY a compact single-line JSON object, exactly one entry per id "
+          "above, no preamble and no markdown fences:\n"
+        + '{"verdicts":[{"id":0, ' + _JUDGE_VERDICT_SCHEMA[1:-1] + '}, {"id":1, ...}]}'
     )
 
 
@@ -1136,29 +1420,255 @@ def _judge_via_claude_cli(prompt):
     return _parse_judge_json(res.stdout.strip())
 
 
+def _find_gemini_exe():
+    """Locate the Gemini CLI. npm installs it as gemini.cmd (a batch shim) on Windows -- there
+    is no .exe -- so prefer the shim under %APPDATA%\\npm, then fall back to PATH."""
+    import shutil
+    appdata_npm = os.path.join(os.environ.get("APPDATA", ""), "npm")
+    for cand in ("gemini.cmd", "gemini.exe"):
+        p = os.path.join(appdata_npm, cand)
+        if os.path.exists(p):
+            return p
+    for cand in ("gemini.cmd", "gemini.exe", "gemini"):
+        p = shutil.which(cand)
+        if p:
+            return p
+    raise RuntimeError("gemini CLI not found on PATH (install: npm i -g @google/gemini-cli)")
+
+
+def _gemini_chat(prompt, model):
+    """LLM call via the local Gemini CLI subprocess. Returns the raw stdout text.
+
+    Inference runs on the user's OAuth Google login (cached in ~/.gemini) through the GCP
+    project named in GOOGLE_CLOUD_PROJECT. The Gemini quota is RATE-limited (requests/min and
+    /day), NOT billed per token, so the scarce resource is the NUMBER of calls -- the pipeline
+    caps concurrency (GEMINI_MAX_WORKERS) and backs off on rate-limit errors rather than
+    hammering the endpoint. See memory: gemini-cli-zero-cost-backend.
+
+    Details that matter:
+      - Prompt goes on STDIN, not argv (Windows caps the command line ~32k chars).
+      - The CLI has no JSON mode; -p carries only a short closing instruction, and the caller's
+        tolerant parser (_extract_json_obj) pulls the JSON object out of the reply.
+      - env GEMINI_CLI_TRUST_WORKSPACE=true passes the headless trusted-workspace gate.
+      - On timeout, TREE-kill (taskkill /T): the npm shim spawns a node child that survives a
+        normal kill and holds the pipes open, hanging the run forever.
+      - Rate-limit / quota (429, RESOURCE_EXHAUSTED) is retried with exponential backoff; auth
+        failure fails fast with a clear 're-login' message (retrying can't fix a dead token).
+    """
+    exe = _find_gemini_exe()
+    env = {**os.environ, "GEMINI_CLI_TRUST_WORKSPACE": "true"}
+    cmd = [exe, "-m", model, "-p", "Respond now with the JSON object only."]
+
+    def _run_once():
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                errors="replace", env=env, cwd=str(HERE))
+        try:
+            out, err = proc.communicate(input=prompt, timeout=GEMINI_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:                                   # tree-kill the surviving node child
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+            except OSError:
+                proc.kill()
+            proc.wait()
+            raise RuntimeError(f"gemini CLI timed out after {GEMINI_TIMEOUT}s (tree-killed)")
+        return proc.returncode, out or "", err or ""
+
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        rc, out, err = _run_once()
+        if rc == 0:
+            return out
+        blob = (err or out or "").lower()
+        if any(w in blob for w in ("login", "oauth", "authenticat", "ineligible", "credential")):
+            raise RuntimeError("gemini CLI auth failed -- run `gemini` once to re-login and confirm "
+                               f"GOOGLE_CLOUD_PROJECT is set. Detail: {(err or out)[:300]}")
+        rate_limited = any(w in blob for w in ("429", "rate limit", "rate-limit", "resource_exhausted",
+                                               "resource exhausted", "quota", "too many requests"))
+        if rate_limited and attempt < GEMINI_MAX_RETRIES:
+            # RPM-limited: wait seconds, not milliseconds. Exponential: 8s, 16s, 32s...
+            time.sleep(GEMINI_BACKOFF_BASE * (2 ** attempt))
+            continue
+        raise RuntimeError(f"gemini CLI failed (exit {rc}): {(err or out)[:400]}")
+    raise RuntimeError("gemini CLI: exhausted retries")  # unreachable, keeps intent explicit
+
+
+def _judge_via_gemini_cli(prompt):
+    """One judgment via the local Gemini CLI ($0 OAuth-quota backend). Raises on failure."""
+    return _extract_json_obj(_gemini_chat(prompt, JUDGE_MODEL))
+
+
+def _judge_call_fn():
+    """Return the judge-call function for the active JUDGE_BACKEND. Each takes a prompt and
+    returns a parsed verdict dict (or None if the model output had no JSON object)."""
+    if JUDGE_BACKEND == "gemini":
+        return _judge_via_gemini_cli
+    if JUDGE_BACKEND == "openrouter":
+        return _judge_via_openrouter
+    return _judge_via_claude_cli
+
+
+def _judge_workers():
+    """Effective judge/triage thread count. The gemini CLI spawns a subprocess per call and is
+    quota/rate-limited, so cap its concurrency; HTTP/CLI-Claude paths keep JUDGE_WORKERS."""
+    if JUDGE_BACKEND == "gemini":
+        return min(GEMINI_MAX_WORKERS, JUDGE_WORKERS)
+    return JUDGE_WORKERS
+
+
+def _headline_key(article):
+    """Normalized headline key -- same rule merge_news dedups on, so the recall loop can tell a
+    genuinely new article from one already in the judged feed."""
+    return re.sub(r"\W+", "", (article.get("headline", "") or "")).lower()[:90]
+
+
+def build_refute_prompt(company, sector_name, signal):
+    """Skeptic prompt: challenge whether a flagged signal is really CREDIT-material. Biased to
+    KEEP (only refute when clearly not credit-material) so the precision pass never quietly
+    undoes the recall loop -- see memory: self-critique that defaulted to 'reject' biased scores
+    down and was dropped."""
+    return (
+        "You are a skeptical S&P credit analyst double-checking a colleague's work. They flagged "
+        "the news below as a MATERIAL credit-rating event. Challenge it: is it genuinely material "
+        "to the CREDIT rating (leverage, liquidity, cash flow, refinancing, covenants, a major "
+        "debt/capex/strategic shift), or is it equity-only noise, routine, or too vague to size?\n"
+        f"COMPANY: {company}   |   S&P SECTOR: {sector_name}\n"
+        f"CLAIMED EVENT : {signal.get('event_summary', '')}\n"
+        f"DIRECTION     : {signal.get('direction', '')}   CATEGORY: {signal.get('risk_category', '')}\n"
+        f"HEADLINE      : {signal.get('headline', '')}\n"
+        f"ARTICLE:\n{(signal.get('full_text', '') or '')[:MAX_ARTICLE_CHARS]}\n\n"
+        "Only answer material=false if you are CONFIDENT this is not a credit-material event; if "
+        "there is a plausible credit angle, keep it (material=true).\n"
+        'Respond with ONLY compact JSON: {"material": true, "reason": "<one line>"}'
+    )
+
+
+def build_refute_batch_prompt(company, sector_name, batch):
+    """Challenge MANY signals in one call -- request-efficient for the rate-limited Gemini
+    backend. Same conservative stance as the single refute prompt (keep unless clearly not
+    credit-material); returns a JSON array of keep/drop verdicts keyed by id."""
+    blocks = []
+    for i, s in enumerate(batch):
+        blocks.append(
+            f"--- SIGNAL id={i} ---\n"
+            f"CLAIMED EVENT: {s.get('event_summary', '')}\n"
+            f"DIRECTION: {s.get('direction', '')}   CATEGORY: {s.get('risk_category', '')}\n"
+            f"HEADLINE: {s.get('headline', '')}"
+        )
+    return (
+        "You are a skeptical S&P credit analyst double-checking a colleague's work. For EACH "
+        "signal below, decide whether it is genuinely MATERIAL to the CREDIT rating (leverage, "
+        "liquidity, cash flow, refinancing, covenants, a major debt/capex/strategic shift), or "
+        "whether it is equity-only noise, routine, or too vague to size.\n"
+        f"COMPANY: {company}   |   S&P SECTOR: {sector_name}\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nOnly answer material=false when you are CONFIDENT a signal is not credit-material; "
+          "if there is a plausible credit angle, keep it (material=true).\n"
+        'Respond with ONLY compact JSON, one entry per id above:\n'
+        '{"verdicts":[{"id":0,"material":true},{"id":1,"material":false}]}'
+    )
+
+
+def adversarial_verify(signals, company, sector_name):
+    """Precision guard for the recall loop: challenge each material signal to refute its
+    credit-materiality. Returns (kept, demoted). Conservative -- a signal is demoted ONLY when
+    the skeptic is confident it is not material; LLM/parse failures (or a missing id in the
+    batched reply) keep the signal (never drop a real one over a hiccup). Demoted signals become
+    near-misses, not discarded. On Gemini, signals are challenged GEMINI_VERIFY_BATCH per call."""
+    if not signals:
+        return signals, []
+
+    if JUDGE_BACKEND == "gemini" and GEMINI_VERIFY_BATCH > 1:
+        chunks = [(i, signals[i:i + GEMINI_VERIFY_BATCH])
+                  for i in range(0, len(signals), GEMINI_VERIFY_BATCH)]
+
+        def verify_chunk(chunk):
+            offset, batch = chunk
+            try:
+                # Adversarial verify is a light yes/no -- run it on Flash, not the 2.5-Pro judge.
+                obj = _extract_json_obj(_gemini_chat(
+                    build_refute_batch_prompt(company, sector_name, batch),
+                    GEMINI_TRIAGE_MODEL)) or {}
+                keep = {}
+                for v in obj.get("verdicts", []):
+                    if isinstance(v, dict) and "id" in v:
+                        try:
+                            keep[offset + int(v["id"])] = bool(v.get("material", True))
+                        except (TypeError, ValueError):
+                            continue
+                return keep
+            except Exception:  # noqa: BLE001
+                return {}                        # keep every signal in this chunk on failure
+
+        keep_flags = {}
+        with ThreadPoolExecutor(max_workers=_judge_workers()) as pool:
+            for kmap in pool.map(verify_chunk, chunks):
+                keep_flags.update(kmap)
+        kept    = [s for i, s in enumerate(signals) if keep_flags.get(i, True)]
+        demoted = [s for i, s in enumerate(signals) if not keep_flags.get(i, True)]
+        return kept, demoted
+
+    # Per-signal path (non-Gemini backends).
+    call = _judge_call_fn()
+
+    def challenge(sig):
+        try:
+            v = call(build_refute_prompt(company, sector_name, sig))
+        except Exception:  # noqa: BLE001
+            return sig, True                     # on failure, keep (don't drop a real signal)
+        if not isinstance(v, dict):
+            return sig, True
+        return sig, bool(v.get("material", True))
+
+    with ThreadPoolExecutor(max_workers=_judge_workers()) as pool:
+        results = list(pool.map(challenge, signals))
+    kept    = [s for s, ok in results if ok]
+    demoted = [s for s, ok in results if not ok]
+    return kept, demoted
+
+
 def _openrouter_chat(prompt, model, max_tokens=500):
-    """Raw OpenRouter chat completion. Returns the message content string. Raises on failure."""
+    """Raw OpenRouter chat completion. Returns the message content string. Raises on failure.
+    Retries transient failures (network errors, 429, 5xx) up to 3 attempts with exponential
+    backoff so one slow/rate-limited call doesn't silently drop a signal."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set")
-    resp = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/Joywin-International-Limited/credit-risk-news-scraper",
-            "X-Title": "Joywin Credit Risk Pipeline",
-        },
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
-            "max_tokens": max_tokens,
-        },
-        timeout=JUDGE_TIMEOUT,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    return resp.json()["choices"][0]["message"]["content"]
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/Joywin-International-Limited/credit-risk-news-scraper",
+                    "X-Title": "Joywin Credit Risk Pipeline",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": max_tokens,
+                },
+                timeout=JUDGE_TIMEOUT,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            data = resp.json()
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if not choices:
+                raise RuntimeError(f"no choices in response: {str(data)[:200]}")
+            return choices[0].get("message", {}).get("content", "")
+        except (requests.RequestException, RuntimeError) as exc:
+            last_exc = exc
+            transient = isinstance(exc, requests.RequestException) or \
+                        any(c in str(exc) for c in (" 429", " 500", " 502", " 503", " 504"))
+            if attempt < 2 and transient:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # unreachable, but keeps intent explicit
 
 
 def _judge_via_openrouter(prompt):
@@ -1174,7 +1684,7 @@ def judge_article(company, sector_name, matched_criterion, headline, article_tex
     """
     prompt = build_judge_prompt(company, sector_name, matched_criterion, headline,
                                 article_text, debt_context)
-    call   = _judge_via_openrouter if JUDGE_BACKEND == "openrouter" else _judge_via_claude_cli
+    call   = _judge_call_fn()
 
     for attempt in (1, 2):
         try:
@@ -1189,45 +1699,31 @@ def judge_article(company, sector_name, matched_criterion, headline, article_tex
     return None
 
 
-def run_judge_articles(articles, company, sector_name, debt_context=""):
-    """
-    Judge all filtered articles in parallel. Returns (materials, near_misses):
-      - materials  : articles the judge marked material AND confident (>= MIN_JUDGE_CONFIDENCE)
-      - near_misses: everything else it judged (immaterial or below the bar), sorted by
-                     confidence -- surfaced as "closest candidates" when nothing qualifies,
-                     so a 0-signal run still shows the analyst what was reviewed.
-    """
-    def work(article):
-        verdict = judge_article(
-            company, sector_name,
-            article["matched_criterion"],
-            article.get("headline", ""),
-            article.get("full_text", ""),
-            debt_context,
-        )
-        if not verdict:
-            return None
-        try:
-            confidence = float(verdict.get("confidence", 0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        out = dict(article)
-        out.update({
-            "material":      bool(verdict.get("material")),
-            "risk_category": verdict.get("risk_category", "Neither"),
-            "sp_factor":     verdict.get("sp_factor", ""),
-            "direction":     verdict.get("direction", "neutral"),
-            "confidence":    round(confidence, 3),
-            "key_figures":   verify_figures(verdict.get("key_figures", []),
-                                            article.get("full_text", "")),
-            "event_summary": verdict.get("event_summary", ""),
-            "rationale":     verdict.get("rationale", ""),
-        })
-        return out
+def _annotate_verdict(article, verdict):
+    """Attach a parsed judge verdict to its article dict (shared by the per-article and batched
+    judge paths). key_figures are verified against the source text (anti-hallucination)."""
+    try:
+        confidence = float(verdict.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    out = dict(article)
+    out.update({
+        "material":      bool(verdict.get("material")),
+        "risk_category": verdict.get("risk_category", "Neither"),
+        "sp_factor":     verdict.get("sp_factor", ""),
+        "direction":     verdict.get("direction", "neutral"),
+        "confidence":    round(confidence, 3),
+        "key_figures":   verify_figures(verdict.get("key_figures", []),
+                                        article.get("full_text", "")),
+        "event_summary": verdict.get("event_summary", ""),
+        "rationale":     verdict.get("rationale", ""),
+    })
+    return out
 
-    with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
-        judged = [v for v in pool.map(work, articles) if v is not None]
 
+def _split_materials(judged):
+    """Partition judged articles into (materials, near_misses). Material = judged material AND
+    confidence >= MIN_JUDGE_CONFIDENCE; the rest are near-misses, sorted by confidence."""
     materials, near = [], []
     for r in judged:
         if r["material"] and r["confidence"] >= MIN_JUDGE_CONFIDENCE:
@@ -1236,6 +1732,121 @@ def run_judge_articles(articles, company, sector_name, debt_context=""):
             near.append(r)
     near.sort(key=lambda r: r["confidence"], reverse=True)
     return materials, near
+
+
+def _verdict_key(company, article):
+    """Stable cache key for one article's judge verdict. Includes everything the verdict depends
+    on, so a change in company/article/criterion/model/prompt invalidates it automatically."""
+    import hashlib
+    raw = "|".join([company or "", article.get("url", "") or "",
+                    article.get("headline", "") or "", article.get("matched_criterion", "") or "",
+                    JUDGE_MODEL or "", _JUDGE_PROMPT_VERSION])
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _load_cached_verdict(company, article):
+    """Return a previously cached raw verdict dict for this article, or None."""
+    if not VERDICT_CACHE:
+        return None
+    p = HERE / ".cache" / "verdicts" / f"{_verdict_key(company, article)}.json"
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _save_verdict(company, article, verdict):
+    """Persist a raw verdict dict so future runs of the same issuer reuse it (reproducible + free)."""
+    if not VERDICT_CACHE or not verdict:
+        return
+    d = HERE / ".cache" / "verdicts"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{_verdict_key(company, article)}.json").write_text(
+            json.dumps(verdict), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _judge_batched_raw(articles, company, sector_name, debt_context):
+    """Judge GEMINI_JUDGE_BATCH articles per Gemini call. Returns [(article, verdict|None)].
+    A batch whose JSON can't be parsed is retried once, then its articles come back None."""
+    batches = [articles[i:i + GEMINI_JUDGE_BATCH]
+               for i in range(0, len(articles), GEMINI_JUDGE_BATCH)]
+
+    def judge_one_batch(batch):
+        prompt = build_batch_judge_prompt(company, sector_name, debt_context, batch)
+        for attempt in (1, 2):
+            try:
+                obj = _extract_json_obj(_gemini_chat(prompt, JUDGE_MODEL)) or {}
+                verdicts = obj.get("verdicts")
+                if not isinstance(verdicts, list) or not verdicts:
+                    raise ValueError("no verdicts array in judge output")
+                by_id = {}
+                for v in verdicts:
+                    if isinstance(v, dict) and "id" in v:
+                        try:
+                            by_id[int(v["id"])] = v
+                        except (TypeError, ValueError):
+                            continue
+                return [(a, by_id.get(i)) for i, a in enumerate(batch)]
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 2:
+                    print(f"    [judge batch skipped] {str(exc).splitlines()[0][:100]}")
+                    return [(a, None) for a in batch]
+        return [(a, None) for a in batch]
+
+    with ThreadPoolExecutor(max_workers=_judge_workers()) as pool:
+        return [pair for res in pool.map(judge_one_batch, batches) for pair in res]
+
+
+def _judge_per_article_raw(articles, company, sector_name, debt_context):
+    """Judge one article per call (non-Gemini backends). Returns [(article, verdict|None)]."""
+    def work(article):
+        v = judge_article(company, sector_name, article["matched_criterion"],
+                          article.get("headline", ""), article.get("full_text", ""), debt_context)
+        return (article, v)
+
+    with ThreadPoolExecutor(max_workers=_judge_workers()) as pool:
+        return list(pool.map(work, articles))
+
+
+def run_judge_articles(articles, company, sector_name, debt_context=""):
+    """
+    Judge all filtered articles. Returns (materials, near_misses):
+      - materials  : articles the judge marked material AND confident (>= MIN_JUDGE_CONFIDENCE)
+      - near_misses: everything else it judged (immaterial or below the bar), sorted by confidence.
+    Verdicts are cached per article (VERDICT_CACHE): a re-run of the same issuer reuses prior
+    judgments verbatim -- identical output and zero repeat LLM calls. Only uncached articles are
+    sent to the model, batched (GEMINI_JUDGE_BATCH) on Gemini, one-per-call elsewhere.
+    """
+    if not articles:
+        return [], []
+
+    judged, to_judge = [], []
+    for a in articles:
+        cached = _load_cached_verdict(company, a)
+        if cached is not None:
+            judged.append(_annotate_verdict(a, cached))
+        else:
+            to_judge.append(a)
+
+    if to_judge:
+        if JUDGE_BACKEND == "gemini" and GEMINI_JUDGE_BATCH > 1:
+            pairs = _judge_batched_raw(to_judge, company, sector_name, debt_context)
+        else:
+            pairs = _judge_per_article_raw(to_judge, company, sector_name, debt_context)
+        for a, v in pairs:
+            if v:
+                _save_verdict(company, a, v)
+                judged.append(_annotate_verdict(a, v))
+
+    reused = len(articles) - len(to_judge)
+    if reused:
+        print(f"  Verdict cache: {reused} reused, {len(to_judge)} judged fresh")
+    return _split_materials(judged)
 
 
 # ==========================================
@@ -2516,7 +3127,7 @@ def _choose_judge():
         if not 0 <= idx < len(JUDGE_CHOICES):
             raise ValueError
     except ValueError:
-        print("  Invalid choice; using 1 (Claude Haiku CLI).")
+        print("  Invalid choice; using 1 (Claude Haiku 4.5 via OpenRouter).")
         idx = 0
     _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
 
@@ -2534,7 +3145,7 @@ def run_pipeline():
     print("=" * 65)
 
     # Non-interactive mode for batch runs / the backtest harness:
-    #   python credit_risk_pipeline.py TICKER "Company Name" START END [JUDGE_CHOICE 1-7]
+    #   python credit_risk_pipeline.py TICKER "Company Name" START END [JUDGE_CHOICE 1-8]
     cli = sys.argv[1:]
     if len(cli) >= 4:
         TICKER, COMPANY_NAME = cli[0].upper(), cli[1]
@@ -2573,10 +3184,20 @@ def run_pipeline():
               "OpenRouter model.")
         return
 
+    if JUDGE_BACKEND == "gemini":
+        try:
+            _find_gemini_exe()
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            return
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            print("  WARNING: GOOGLE_CLOUD_PROJECT is not set. A Workspace Google account needs it "
+                  "for the free Gemini CLI tier; a personal @gmail account can ignore this.\n")
+
     print("Loading NLP models...")
     encoder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    with open("sector_risk_kw_new.json", "r", encoding="utf-8") as f:
+    with open(HERE / "sector_risk_kw_new.json", "r", encoding="utf-8") as f:
         sp_criteria_master = json.load(f)
 
     # ── Phase 1: Routing ──────────────────────────────────────────
@@ -2620,11 +3241,16 @@ def run_pipeline():
             f"https://finnhub.io/api/v1/company-news"
             f"?symbol={TICKER}&from={START_DATE}&to={END_DATE}&token={FINNHUB_API_KEY}"
         )
-        try:
-            resp = requests.get(finnhub_url, timeout=15).json()
-            news_data = resp if isinstance(resp, list) else []
-        except Exception:  # noqa: BLE001
-            news_data = []
+        for attempt in range(3):
+            try:
+                resp = requests.get(finnhub_url, timeout=15).json()
+                news_data = resp if isinstance(resp, list) else []
+                break
+            except Exception:  # noqa: BLE001
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                news_data = []
         print(f"  Finnhub articles fetched : {len(news_data)}")
 
     if USE_GDELT:
@@ -2644,14 +3270,21 @@ def run_pipeline():
     # Entity gate: keep only articles that actually name the issuer. Finnhub tags generic
     # market commentary and competitor stories to big tickers; those are pure downstream
     # noise. Fall back to the full feed only if the gate removes everything (name mismatch).
+    # GDELT items are already scoped by an exact company-name-phrase query, so trust them and
+    # skip the headline gate (their summary is only the title, which the strict gate would drop
+    # ~90% of). The gate still applies to Finnhub/Google News, whose ticker tagging is noisy.
     is_about = build_entity_matcher(COMPANY_NAME, TICKER)
-    on_topic = [a for a in news_data if is_about(a)]
+    on_topic = [a for a in news_data if a.get("provider") == "gdelt" or is_about(a)]
     if on_topic:
         dropped = len(news_data) - len(on_topic)
         print(f"  On-topic (names issuer)  : {len(on_topic)}  ({dropped} off-topic dropped)")
         news_data = on_topic
     elif news_data:
         print("  [entity gate matched 0 -- keeping full feed; check company name spelling]")
+
+    # Deterministic order (newest first, headline tiebreak) so the same feed always yields the
+    # same triage/judge sequence -- one less source of run-to-run variance.
+    news_data.sort(key=lambda a: (-(a.get("datetime") or 0), a.get("headline", "")))
 
     # "What's happening" digest: every on-topic article, whether or not it scores.
     news_digest = build_news_digest(news_data)
@@ -2664,69 +3297,127 @@ def run_pipeline():
     near_misses = []   # judged-but-below-bar candidates, shown when no news qualifies
 
     if USE_LLM_JUDGE:
-        # ── Phase 2: relevance filter -- LLM triage (default) or cross-encoder (fallback) ──
-        if USE_LLM_TRIAGE and OPENROUTER_API_KEY:
-            print(f"\n[Phase 2] LLM credit-materiality triage ({len(news_data)} on-topic "
-                  f"-> keep score >= {TRIAGE_MIN_SCORE}, cap {TRIAGE_MAX_KEEP}) via {TRIAGE_MODEL}...")
-            ranked   = triage_articles(news_data, COMPANY_NAME,
-                                       target_sector["sector_name"], criteria_texts)
-            filtered = [a for a in ranked if a["_triage_score"] >= TRIAGE_MIN_SCORE][:TRIAGE_MAX_KEEP]
-            if not filtered:                       # triage failed/empty -> don't starve the judge
-                filtered = ranked[:TRIAGE_MAX_KEEP]
-                print("  [triage returned no scored articles -- falling back to most-recent feed]")
-            top_score = ranked[0]["_triage_score"] if ranked else 0
-            print(f"  Kept : {len(filtered)} articles (credit-materiality >= {TRIAGE_MIN_SCORE}; "
-                  f"top score {top_score:.0f}/10)")
-        else:
-            print(f"\n[Phase 2] Cross-encoder relevance filter ({len(news_data)} on-topic -> top {CROSSENCODER_TOP_N})...")
-            print("  Loading cross-encoder model...")
-            filtered = filter_with_crossencoder(news_data, criteria_texts, criteria_labels)
-            print(f"  Kept : {len(filtered)} articles (best match to S&P criteria)")
-
-        # ── Phase 3: Scrape only the filtered articles ────────────
-        print(f"\n[Phase 3] Scraping {len(filtered)} selected articles ({SCRAPE_WORKERS} threads)...")
-
-        def fetch(article):
-            url     = article.get("url", "")
-            summary = article.get("summary", "")
-            if url:
-                text, resolved = scrape_full_text(url, summary)
-            else:
-                text, resolved = summary, url
-            scraped = text != summary
-            article = dict(article)
-            article["full_text"] = text
-            if resolved:                         # store the clickable publisher URL
-                article["url"] = resolved
-            article["date"] = datetime.datetime.fromtimestamp(
-                article.get("datetime", 0)).strftime("%Y-%m-%d")
-            return article, scraped
-
-        with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as pool:
-            fetched_pairs = list(pool.map(fetch, filtered))
-
-        scraped_count  = sum(1 for _, s in fetched_pairs if s)
-        fallback_count = len(fetched_pairs) - scraped_count
-        fetched_articles = [a for a, _ in fetched_pairs]
-        print(f"  Full-text scraped : {scraped_count} | Summary fallback : {fallback_count}")
-
-        # ── Phase 4: Local-Claude judge (one call per article) ────
-        print(f"\n[Phase 4] Judge: {JUDGE_MODEL} via {JUDGE_BACKEND} ({JUDGE_WORKERS} workers)...")
-        # Short point-in-time debt line so the judge can size Financial Risk correctly
-        # (rule in the prompt forbids restating these figures in its prose).
+        sector_name = target_sector["sector_name"]
+        # Point-in-time debt line so the judge can size Financial Risk correctly. Independent of
+        # which articles we feed it, so compute once and reuse across every recall round.
         mcap = financials.get("market_cap") or financials.get("market_cap_fallback")
         debt_ctx = ""
         if financials.get("total_debt") is not None or mcap:
             debt_ctx = (f"total debt {_fmt_money(financials.get('total_debt'))}, "
                         f"market cap {_fmt_money(mcap)} (as of {financials.get('as_of')})")
-        all_signals, near_misses = run_judge_articles(fetched_articles, COMPANY_NAME,
-                                                       target_sector["sector_name"], debt_ctx)
-        print(f"  Judged material : {len(all_signals)}"
-              f"  ({len(near_misses)} reviewed but below the bar)")
+
+        def judge_batch(articles, round_idx):
+            """Phases 2-4 for one batch of articles: triage -> scrape survivors -> judge.
+            round_idx>=2 relaxes the triage bar (LOOP_RELAX_TRIAGE) to widen the recall net on
+            later rounds. Returns (materials, near_misses, scraped_count, fallback_count, kept)."""
+            if not articles:
+                return [], [], 0, 0, 0
+            # ── Phase 2: relevance filter -- LLM triage (default) or cross-encoder (fallback) ──
+            if USE_LLM_TRIAGE and (OPENROUTER_API_KEY or JUDGE_BACKEND == "gemini"):
+                triage_model = GEMINI_TRIAGE_MODEL if JUDGE_BACKEND == "gemini" else TRIAGE_MODEL
+                min_score = LOOP_RELAX_TRIAGE if round_idx >= 2 else TRIAGE_MIN_SCORE
+                print(f"\n[Phase 2] LLM credit-materiality triage ({len(articles)} articles "
+                      f"-> keep score >= {min_score}, cap {TRIAGE_MAX_KEEP}) via {triage_model}...")
+                ranked = triage_articles(articles, COMPANY_NAME, sector_name, criteria_texts)
+                kept   = [a for a in ranked if a["_triage_score"] >= min_score][:TRIAGE_MAX_KEEP]
+                if not kept:                       # triage failed/empty -> don't starve the judge
+                    kept = ranked[:TRIAGE_MAX_KEEP]
+                    print("  [triage returned no scored articles -- falling back to most-recent]")
+                top_score = ranked[0]["_triage_score"] if ranked else 0
+                print(f"  Kept : {len(kept)} articles (materiality >= {min_score}; "
+                      f"top score {top_score:.0f}/10)")
+            else:
+                print(f"\n[Phase 2] Cross-encoder relevance filter ({len(articles)} -> top {CROSSENCODER_TOP_N})...")
+                print("  Loading cross-encoder model...")
+                kept = filter_with_crossencoder(articles, criteria_texts, criteria_labels)
+                print(f"  Kept : {len(kept)} articles (best match to S&P criteria)")
+
+            # ── Phase 3: Scrape only the filtered articles ────────────
+            print(f"\n[Phase 3] Scraping {len(kept)} selected articles ({SCRAPE_WORKERS} threads)...")
+
+            def fetch(article):
+                # Fully defensive: a single malformed article (bad URL, odd timestamp) must never
+                # crash the scrape pool -- pool.map re-raises worker exceptions and would abort the
+                # whole issuer. On any error, fall back to the summary.
+                article = dict(article)
+                summary = article.get("summary", "")
+                try:
+                    url = article.get("url", "")
+                    if url:
+                        text, resolved = scrape_full_text(url, summary)
+                    else:
+                        text, resolved = summary, url
+                    article["full_text"] = text
+                    if resolved:                     # store the clickable publisher URL
+                        article["url"] = resolved
+                    scraped = text != summary
+                except Exception:  # noqa: BLE001
+                    article["full_text"] = summary
+                    scraped = False
+                try:
+                    ts = article.get("datetime") or 0
+                    article["date"] = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                except (OSError, OverflowError, ValueError, TypeError):
+                    article["date"] = ""             # bad epoch -> leave date blank, never crash
+                return article, scraped
+
+            with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as pool:
+                fetched_pairs = list(pool.map(fetch, kept))
+            sc = sum(1 for _, s in fetched_pairs if s)
+            fc = len(fetched_pairs) - sc
+            fetched_articles = [a for a, _ in fetched_pairs]
+            print(f"  Full-text scraped : {sc} | Summary fallback : {fc}")
+
+            # ── Phase 4: judge (one call per article) ────
+            print(f"\n[Phase 4] Judge: {JUDGE_MODEL} via {JUDGE_BACKEND} ({_judge_workers()} workers)...")
+            mats, nears = run_judge_articles(fetched_articles, COMPANY_NAME, sector_name, debt_ctx)
+            print(f"  Judged material : {len(mats)}  ({len(nears)} reviewed but below the bar)")
+            return mats, nears, sc, fc, len(kept)
+
+        # ── First pass on the full merged feed ──
+        all_signals, near_misses, scraped_count, fallback_count, filtered_count = \
+            judge_batch(news_data, 1)
+        judged_keys = {_headline_key(a) for a in news_data}
+
+        # ── Recall-recovery loop: re-search when material signals are thin ──
+        # Only material-signal count gates the loop (that was the backtest's blind spot). Each
+        # round re-queries GDELT with expanded credit terms, judges only genuinely NEW on-topic
+        # articles, and accumulates. Stops on: enough signals, round cap, or a dry round.
+        if USE_RECALL_LOOP and USE_GDELT:
+            rounds = 0
+            while len(all_signals) < LOOP_MIN_MATERIAL and rounds < LOOP_MAX_ROUNDS:
+                rounds += 1
+                terms = build_recall_query(COMPANY_NAME, target_sector, rounds + 1)
+                print(f"\n[Recall loop {rounds}/{LOOP_MAX_ROUNDS}] only {len(all_signals)} material "
+                      f"(< {LOOP_MIN_MATERIAL}) -- re-searching GDELT with {len(terms)} credit terms...")
+                extra = fetch_gdelt_news(COMPANY_NAME, TICKER, START_DATE, END_DATE,
+                                         extra_terms=terms)
+                fresh = merge_news([a for a in extra
+                                    if _headline_key(a) not in judged_keys and is_about(a)])
+                if not fresh:
+                    print("  Round added no new on-topic articles -- stopping loop.")
+                    break
+                for a in fresh:
+                    judged_keys.add(_headline_key(a))
+                print(f"  {len(fresh)} new on-topic articles -> judging...")
+                m, n, sc, fc, kc = judge_batch(fresh, rounds + 1)
+                all_signals    += m
+                near_misses    += n
+                scraped_count  += sc
+                fallback_count += fc
+                filtered_count += kc
+                print(f"  Round {rounds}: +{len(m)} material (running total {len(all_signals)})")
 
         if USE_FINBERT and all_signals:
             print("\n[Phase 4b] FinBERT tone (second opinion)...")
             all_signals = add_finbert_tone(all_signals)
+
+        # ── Phase 4c: adversarial verification -- precision guard for the wider recall net ──
+        if USE_ADVERSARIAL_VERIFY and all_signals:
+            print(f"\n[Phase 4c] Adversarial verify: challenging {len(all_signals)} material signals...")
+            all_signals, demoted = adversarial_verify(all_signals, COMPANY_NAME, sector_name)
+            near_misses += demoted
+            print(f"  Confirmed {len(all_signals)} | {len(demoted)} demoted to near-miss")
 
         # Clean internal scratch fields.
         for s in all_signals + near_misses:
@@ -2929,7 +3620,7 @@ def run_pipeline():
         },
         "stats": {
             "articles_fetched":    len(news_data),
-            "after_ce_filter":     len(filtered) if USE_LLM_JUDGE else None,
+            "after_ce_filter":     filtered_count if USE_LLM_JUDGE else None,
             "full_text_scraped":   scraped_count,
             "summary_fallback":    fallback_count,
             "judged_material":     len(all_signals) if USE_LLM_JUDGE else None,
@@ -2947,8 +3638,9 @@ def run_pipeline():
         "news_digest": news_digest,
     }
 
-    os.makedirs("results", exist_ok=True)
-    output_filename = os.path.join("results", f"credit_signals_{TICKER}_{END_DATE}.json")
+    results_dir = HERE / "results"
+    os.makedirs(results_dir, exist_ok=True)
+    output_filename = os.path.join(results_dir, f"credit_signals_{TICKER}_{END_DATE}.json")
     with open(output_filename, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
