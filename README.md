@@ -15,7 +15,7 @@ Rating agencies lag real-world events by weeks to months. This pipeline creates 
 | 1 | **Ingestion, routing & entity gate** | Fetches news from **Finnhub + GDELT** (merged, de-duplicated); routes the issuer to the correct S&P sector with an **LLM sector router** (Yahoo industry + business summary → S&P sector; embedding/override fallback); drops articles that don't actually name the issuer (**entity gate**) |
 | 2 | **LLM credit-materiality triage** | A cheap LLM scores every on-topic article 0–10 for credit materiality and forwards the top ~40 to the judge. Replaces the old cross-encoder, which rewarded generic money-language and buried real stories. Cross-encoder is retained as a fallback |
 | 3 | **Selective full-text scraping** | Downloads full text for the filtered articles only (**trafilatura → newspaper3k → summary** fallback); resolves Finnhub redirect URLs to the real publisher page |
-| 4 | **The judge** | An LLM reads the full article against the S&P sector criteria and returns a structured credit signal: direction, confidence, S&P factor, event summary, rationale, and verbatim `key_figures` (guarded by `verify_figures`, which drops any number not present in the source text). Backend chosen at startup: **OpenRouter** (default, e.g. Haiku 4.5) or local **Claude Code CLI** |
+| 4 | **The judge** | An LLM reads the full article against the S&P sector criteria and returns a structured credit signal: direction, confidence, S&P factor, event summary, rationale, and verbatim `key_figures` (guarded by `verify_figures`, which drops any number not present in the source text). Backend chosen at startup: **OpenRouter** (e.g. Haiku 4.5), local **Claude Code CLI**, or the local **Gemini CLI** (gemini-2.5-pro, **$0** via your Google OAuth quota — the default for zero-cost runs) |
 | 4b | **FinBERT tone** | Secondary sentiment check on the judge's event summary; flags `tone_alignment = divergent`. **The judge's credit direction is authoritative** — FinBERT has no bondholder context |
 | 5 | **Event dedup, scoring & report** | Clusters same-event signals and reconciles them to **one vote per event** (conflicting reads cancel); weights by outlet coverage; computes a normalized score with evidence shrinkage; 5-band verdict + conviction; **bootstrap uncertainty band**; market snapshot / priced-in check; deterministic fundamentals signal; always-on financial panel + developing-news + equity digest |
 
@@ -29,8 +29,9 @@ Rating agencies lag real-world events by weeks to months. This pipeline creates 
 | [Finnhub API key](https://finnhub.io/) | Free tier sufficient. GDELT needs no key. |
 | [OpenRouter API key](https://openrouter.ai/) | Default path: powers Phase 2 triage and the Phase 4 judge. |
 | [Claude Code CLI](https://claude.ai/code) | Optional alternative judge backend (`claude -p`, uses your Claude subscription). Choose it at startup instead of OpenRouter. |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Optional **$0** judge backend (gemini-2.5-pro, local Google OAuth quota). Workspace accounts also need `GOOGLE_CLOUD_PROJECT`. Rate-limited (not billed), so a cold run is slower; results cache for instant re-runs. |
 
-> Running with **no OpenRouter key**: set `USE_LLM_TRIAGE = False` (falls back to the cross-encoder) and pick the Claude CLI judge at startup.
+> Running with **no OpenRouter key**: pick the **Gemini CLI ($0)** or **Claude CLI** judge at startup. Both also drive Phase-2 triage, so no OpenRouter key is required.
 
 ---
 
@@ -58,6 +59,13 @@ Optional Claude CLI backend:
 
 ```powershell
 irm https://claude.ai/install.ps1 | iex   # then run `claude` once to log in
+```
+
+Optional Gemini CLI backend (**$0**):
+
+```bash
+npm install -g @google/gemini-cli        # then run `gemini` once to log in
+export GOOGLE_CLOUD_PROJECT=your-gcp-project-id   # Workspace accounts only
 ```
 
 `spaCy` (`en_core_web_sm`) is only needed for the legacy cosine path (`USE_LLM_JUDGE = False`).
@@ -190,7 +198,8 @@ Routes issuers to the S&P credit sectors defined in `sector_risk_kw_new.json` (B
 
 | Library / service | Role |
 |---|---|
-| OpenRouter | Triage (Phase 2) + default judge (Phase 4) |
+| OpenRouter | Triage (Phase 2) + judge (Phase 4) |
+| Gemini CLI (`gemini`) | **$0** judge/triage backend (local Google OAuth quota) |
 | Claude Code CLI (`claude -p`) | Alternative judge backend |
 | Finnhub REST API · GDELT DOC 2.0 | News feeds (GDELT keyless, query-scoped, cached) |
 | `sentence-transformers` | Cross-encoder fallback filter + cosine clustering/dedup |
