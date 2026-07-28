@@ -78,6 +78,27 @@ python credit_risk_pipeline.py TICKER "Company Name" START_DATE END_DATE [JUDGE_
 
 Results print to the console and save to `results/credit_signals_{TICKER}_{END_DATE}.json`.
 
+### Pipeline integration (`NewsSignal`)
+
+For the credit engine, add `--output PATH` to also write a **compact `NewsSignal`** (the
+`joywin_contracts` side-input contract) to that path — one overall direction, a score, a
+conviction, and the key events, rather than the full scrape:
+
+```bash
+python credit_risk_pipeline.py AAPL "Apple Inc." 2026-03-01 2026-06-01 --output run/news.json
+```
+
+```jsonc
+{ "verdict": "DOWNGRADE WATCH",   // 5-band credit direction
+  "score": -0.575,                 // signed, evidence-shrunk
+  "conviction": "MEDIUM",          // LOW / MEDIUM / HIGH
+  "events": [ { "date", "direction", "sp_factor", "event", "headline", "url", "confidence" } ] }
+```
+
+Field names are fixed — a rename comes with a heads-up first. With `--output`, all inputs
+must be passed as arguments (it will not drop to interactive prompts). The full `results/`
+JSON is written as well and is unaffected.
+
 **Validation harness** — batch-runs the labelled cases in `backtest_cases.csv` and prints a scoreboard / confusion matrix:
 
 ```bash

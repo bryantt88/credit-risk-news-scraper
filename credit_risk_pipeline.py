@@ -3144,6 +3144,45 @@ def _choose_judge():
     _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
 
 
+def build_news_signal(score_result: dict, signals: list) -> dict:
+    """Compact NewsSignal for the credit engine (joywin_contracts.NewsSignal): one
+    overall credit direction + score + conviction + the key events — NOT the raw
+    scrape. Built from the same numbers the console/report already show, so the
+    engine's side-input matches what a human sees. Field names are the contract."""
+    def _event(s: dict) -> dict:
+        return {
+            "date":          s.get("date", ""),
+            "direction":     s.get("direction", ""),
+            "risk_category": s.get("risk_category", ""),
+            "sp_factor":     s.get("sp_factor", ""),
+            "event":         s.get("event_summary") or s.get("headline", ""),
+            "headline":      s.get("headline", ""),
+            "url":           s.get("url", ""),
+            "confidence":    s.get("confidence"),
+        }
+    return {
+        "verdict":    score_result.get("verdict"),
+        "score":      score_result.get("score"),
+        "conviction": score_result.get("conviction"),
+        "events":     [_event(s) for s in (signals or [])],
+    }
+
+
+def _pop_output_flag(argv: list) -> tuple:
+    """Pull `--output PATH` out of argv (order-independent) so the positional
+    TICKER/COMPANY/START/END parsing is unaffected. Returns (argv_without, path)."""
+    argv = list(argv)
+    path = None
+    if "--output" in argv:
+        i = argv.index("--output")
+        if i + 1 < len(argv):
+            path = argv[i + 1]
+            del argv[i:i + 2]
+        else:
+            del argv[i]
+    return argv, path
+
+
 def run_pipeline():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3159,6 +3198,12 @@ def run_pipeline():
     # Non-interactive mode for batch runs / the backtest harness:
     #   python credit_risk_pipeline.py TICKER "Company Name" START END [JUDGE_CHOICE 1-8]
     cli = sys.argv[1:]
+    cli, news_output_path = _pop_output_flag(cli)
+    if news_output_path is not None and len(cli) < 4:
+        # --output signals the engine (headless) is driving; never drop to prompts.
+        print("ERROR: --output requires all inputs as arguments: "
+              "TICKER \"Company\" START END [JUDGE]  (non-interactive mode cannot prompt).")
+        sys.exit(2)
     if len(cli) >= 4:
         TICKER, COMPANY_NAME = cli[0].upper(), cli[1]
         START_DATE, END_DATE = cli[2], cli[3]
@@ -3657,6 +3702,17 @@ def run_pipeline():
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     print(f"Full output written to: {output_filename}")
+
+    # Compact NewsSignal for the credit engine, written to the caller-given path
+    # (the full results/ JSON above is unaffected — this is the side-input contract).
+    if news_output_path:
+        news_signal = build_news_signal(score_result, top_signals)
+        news_signal["ticker"] = TICKER          # traceability; contract ignores extras
+        os.makedirs(os.path.dirname(os.path.abspath(news_output_path)) or ".", exist_ok=True)
+        with open(news_output_path, "w", encoding="utf-8") as f:
+            json.dump(news_signal, f, indent=2, ensure_ascii=False)
+        print(f"NewsSignal written to: {news_output_path}")
+
     print("=" * 65 + "\n")
 
 
