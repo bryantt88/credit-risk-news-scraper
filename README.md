@@ -92,17 +92,18 @@ python credit_risk_pipeline.py AAPL "Apple Inc." 2026-03-01 2026-06-01 --output 
 { "verdict": "DOWNGRADE WATCH",   // 5-band credit direction
   "score": -0.575,                 // signed, evidence-shrunk
   "conviction": "MEDIUM",          // LOW / MEDIUM / HIGH
-  "summary": "…",                  // one AI-written paragraph on the company's credit news
-  "events":     [ { "date", "direction", "sp_factor", "event", "headline", "url", "confidence" } ],
-  "developing": [ { "date", "headline", "event", "url" } ] }   // >=3 reviewed context stories
+  "summary": "…",                  // one AI-written 2-3 sentence take on the company's credit news
+  "events": [ { "credit_relevant": true,   // true = material (scored); false = neutral context
+                "date", "direction", "sp_factor", "event", "headline", "url", "confidence" } ] }
 ```
 
-`verdict`, `score`, `conviction`, `events` are the `joywin_contracts.NewsSignal` contract;
-`summary` and `developing` are additive extras (the engine ignores them until the contract adds
-them). **`summary` and `developing` are always populated** — so there's a readable news takeaway
-even when nothing clears the materiality bar (`events` is empty). The `summary` is one LLM call on
-the active judge backend (`USE_NEWS_SUMMARY`, default on); it falls back to a deterministic
-one-liner if the LLM is unavailable, so a run never fails for lack of a summary.
+`verdict`, `score`, `conviction`, `events` are the `joywin_contracts.NewsSignal` contract; `summary`
+is an additive extra (the engine ignores it until the contract adds it). **One `events` list holds
+all the news** — each item flagged `credit_relevant` (`true` = a material signal that drove the
+score; `false` = a reviewed but neutral/context story). So the output always carries news even when
+nothing was material (every event is then `false`). The `summary` is one LLM call on the active
+judge backend (`USE_NEWS_SUMMARY`, default on); it falls back to a deterministic one-liner if the
+LLM is unavailable, so a run never fails for lack of a summary.
 
 Field names are fixed — a rename comes with a heads-up first. With `--output`, all inputs must be
 passed as arguments (it will not drop to interactive prompts). The full `results/` JSON is written

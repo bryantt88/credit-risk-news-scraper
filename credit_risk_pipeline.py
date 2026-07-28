@@ -3216,14 +3216,17 @@ def summarize_news(company: str, ticker: str, period: str,
 def build_news_signal(score_result: dict, signals: list,
                       summary: str = "", developing: list = None) -> dict:
     """Compact NewsSignal for the credit engine (joywin_contracts.NewsSignal): one overall
-    credit direction + score + conviction + the key events — NOT the raw scrape. Adds an AI
-    `summary` and a `developing` list (>=3 reviewed stories when available) so the output always
-    carries a news takeaway, even when nothing cleared the materiality bar. `summary`/`developing`
-    are supersets of the 4-field contract (the engine surfaces them once the contract adds them)."""
-    def _event(s: dict) -> dict:
+    credit direction + score + conviction + an AI `summary` + one `events` list of the news.
+
+    Every event is flagged `credit_relevant`: True = a material, scored signal (drives the
+    score); False = a neutral/context story that was reviewed but not material. This keeps a
+    single news list (not two) while letting the reader tell what actually mattered — and the
+    output always carries news, even when nothing cleared the materiality bar."""
+    def _item(s: dict, credit_relevant: bool) -> dict:
         return {
+            "credit_relevant": credit_relevant,   # True = material (scored); False = neutral context
             "date":          s.get("date", ""),
-            "direction":     s.get("direction", ""),
+            "direction":     s.get("direction") or ("" if credit_relevant else "neutral"),
             "risk_category": s.get("risk_category", ""),
             "sp_factor":     s.get("sp_factor", ""),
             "event":         s.get("event_summary") or s.get("headline", ""),
@@ -3231,20 +3234,14 @@ def build_news_signal(score_result: dict, signals: list,
             "url":           s.get("url", ""),
             "confidence":    s.get("confidence"),
         }
-    def _dev(d: dict) -> dict:                    # reviewed context story, compacted
-        return {
-            "date":     d.get("date", ""),
-            "headline": d.get("headline", ""),
-            "event":    d.get("event_summary") or d.get("headline", ""),
-            "url":      d.get("url", ""),
-        }
+    events = ([_item(s, True)  for s in (signals or [])]
+              + [_item(d, False) for d in (developing or [])])
     return {
         "verdict":    score_result.get("verdict"),
         "score":      score_result.get("score"),
         "conviction": score_result.get("conviction"),
         "summary":    summary,
-        "events":     [_event(s) for s in (signals or [])],
-        "developing": [_dev(d) for d in (developing or [])],
+        "events":     events,
     }
 
 
