@@ -1448,8 +1448,11 @@ def _find_gemini_exe():
     raise RuntimeError("gemini CLI not found on PATH (install: npm i -g @google/gemini-cli)")
 
 
-def _gemini_chat(prompt, model):
+def _gemini_chat(prompt, model, closing="Respond now with the JSON object only."):
     """LLM call via the local Gemini CLI subprocess. Returns the raw stdout text.
+
+    `closing` is the short `-p` instruction (JSON callers keep the default; a prose
+    caller passes a plain-text instruction so the model doesn't wrap the reply in JSON).
 
     Inference runs on the user's OAuth Google login (cached in ~/.gemini) through the GCP
     project named in GOOGLE_CLOUD_PROJECT. The Gemini quota is RATE-limited (requests/min and
@@ -1469,7 +1472,7 @@ def _gemini_chat(prompt, model):
     """
     exe = _find_gemini_exe()
     env = {**os.environ, "GEMINI_CLI_TRUST_WORKSPACE": "true"}
-    cmd = [exe, "-m", model, "-p", "Respond now with the JSON object only."]
+    cmd = [exe, "-m", model, "-p", closing]
 
     def _run_once():
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -3144,11 +3147,79 @@ def _choose_judge():
     _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
 
 
-def build_news_signal(score_result: dict, signals: list) -> dict:
-    """Compact NewsSignal for the credit engine (joywin_contracts.NewsSignal): one
-    overall credit direction + score + conviction + the key events — NOT the raw
-    scrape. Built from the same numbers the console/report already show, so the
-    engine's side-input matches what a human sees. Field names are the contract."""
+USE_NEWS_SUMMARY = True   # generate a short AI news narrative (one extra LLM call/run; off = fallback)
+
+
+def _claude_text(prompt: str) -> str:
+    """Plain-text (non-JSON) completion via the local Claude Code CLI."""
+    cmd = [CLAUDE_BIN, "-p", prompt, "--model", JUDGE_MODEL,
+           "--output-format", "json", "--allowedTools", ""]
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                         stdin=subprocess.DEVNULL, timeout=JUDGE_TIMEOUT)
+    if res.returncode != 0:
+        raise RuntimeError((res.stderr or res.stdout or "non-zero exit").strip()[:200])
+    outer = json.loads(res.stdout.strip())
+    return (outer.get("result", "") if isinstance(outer, dict) else str(outer)) or ""
+
+
+def _llm_text(prompt: str) -> str:
+    """One free-form TEXT completion on the active judge backend (prose, not JSON)."""
+    if JUDGE_BACKEND == "gemini":
+        return _gemini_chat(prompt, JUDGE_MODEL,
+                            closing="Respond now with the summary paragraph only, as plain prose.")
+    if JUDGE_BACKEND == "openrouter":
+        return _openrouter_chat(prompt, JUDGE_MODEL)
+    return _claude_text(prompt)
+
+
+def summarize_news(company: str, ticker: str, period: str,
+                   score_result: dict, signals: list, developing: list) -> str:
+    """One short AI narrative of the company's credit-relevant news — so there is ALWAYS a
+    readable takeaway, whatever the state (material signals AND/OR developing context). Best-
+    effort: on any failure it returns a deterministic one-liner and NEVER raises (a summary
+    must not break a scored run)."""
+    verdict    = score_result.get("verdict", "")
+    score      = score_result.get("score", 0)
+    conviction = score_result.get("conviction", "")
+
+    def _line(s):
+        body = (s.get("event_summary") or s.get("headline") or "").strip()
+        return f"- [{s.get('direction','?')}/{s.get('risk_category','?')}] {s.get('sp_factor','')}: {body}"
+    mat = "\n".join(_line(s) for s in (signals or [])) or "  (none cleared the materiality bar)"
+    dev = "\n".join(f"- {d.get('headline','')}" for d in (developing or [])) or "  (none)"
+
+    # Deterministic fallback so a summary always exists (LLM off / unavailable / errored).
+    tops = ([(s.get("event_summary") or s.get("headline") or "") for s in (signals or [])][:3]
+            or [d.get("headline", "") for d in (developing or [])][:3])
+    fallback = (f"{verdict} (score {score}, {conviction} conviction)."
+                + ("" if not any(tops) else " Key items: " + "; ".join(t for t in tops if t) + "."))
+    if not USE_NEWS_SUMMARY:
+        return fallback
+
+    prompt = (
+        f"You are a credit analyst. In 2-3 concise sentences (~60 words), summarize the "
+        f"credit-relevant news for {company} ({ticker}) over {period}. Be factual and specific — "
+        f"name the concrete events and figures; do not hype or speculate. State the overall "
+        f"direction and its single main driver.\n\n"
+        f"Pipeline read: {verdict} (score {score}, {conviction} conviction).\n\n"
+        f"Material credit signals:\n{mat}\n\n"
+        f"Other developing / reviewed news (context, not scored):\n{dev}\n\n"
+        f"Write only the summary paragraph."
+    )
+    try:
+        text = re.sub(r"^```[a-z]*\n?|\n?```$", "", (_llm_text(prompt) or "").strip()).strip()
+        return text or fallback
+    except Exception:  # noqa: BLE001 - a summary must never break the run
+        return fallback
+
+
+def build_news_signal(score_result: dict, signals: list,
+                      summary: str = "", developing: list = None) -> dict:
+    """Compact NewsSignal for the credit engine (joywin_contracts.NewsSignal): one overall
+    credit direction + score + conviction + the key events — NOT the raw scrape. Adds an AI
+    `summary` and a `developing` list (>=3 reviewed stories when available) so the output always
+    carries a news takeaway, even when nothing cleared the materiality bar. `summary`/`developing`
+    are supersets of the 4-field contract (the engine surfaces them once the contract adds them)."""
     def _event(s: dict) -> dict:
         return {
             "date":          s.get("date", ""),
@@ -3160,11 +3231,20 @@ def build_news_signal(score_result: dict, signals: list) -> dict:
             "url":           s.get("url", ""),
             "confidence":    s.get("confidence"),
         }
+    def _dev(d: dict) -> dict:                    # reviewed context story, compacted
+        return {
+            "date":     d.get("date", ""),
+            "headline": d.get("headline", ""),
+            "event":    d.get("event_summary") or d.get("headline", ""),
+            "url":      d.get("url", ""),
+        }
     return {
         "verdict":    score_result.get("verdict"),
         "score":      score_result.get("score"),
         "conviction": score_result.get("conviction"),
+        "summary":    summary,
         "events":     [_event(s) for s in (signals or [])],
+        "developing": [_dev(d) for d in (developing or [])],
     }
 
 
@@ -3656,6 +3736,16 @@ def run_pipeline():
     print_news_digest(news_digest, encoder, company_name=COMPANY_NAME, ticker=TICKER,
                       show_equity=SHOW_EQUITY_NEWS)
 
+    # AI news summary + top developing stories — ALWAYS populated (deterministic fallback if the
+    # LLM is off/unavailable), so there is a readable news takeaway whatever the scored state.
+    developing = developing_news_items(near_misses, 3) if USE_LLM_JUDGE else []
+    news_summary = summarize_news(COMPANY_NAME, TICKER, f"{START_DATE} to {END_DATE}",
+                                  score_result, top_signals, developing)
+    print("\n" + "-" * 65)
+    print("  NEWS SUMMARY")
+    print("-" * 65)
+    print(news_summary + "\n")
+
     output = {
         "ticker":            TICKER,
         "company_name":      COMPANY_NAME,
@@ -3690,6 +3780,7 @@ def run_pipeline():
         "market_context":     market_ctx,
         "key_figures_summary": agg_figures,
         "contradictions":     contradictions,
+        "news_summary":       news_summary,
         "credit_score": score_result,
         "signals": top_signals,
         "news_digest": news_digest,
@@ -3706,7 +3797,8 @@ def run_pipeline():
     # Compact NewsSignal for the credit engine, written to the caller-given path
     # (the full results/ JSON above is unaffected — this is the side-input contract).
     if news_output_path:
-        news_signal = build_news_signal(score_result, top_signals)
+        news_signal = build_news_signal(score_result, top_signals,
+                                        summary=news_summary, developing=developing)
         news_signal["ticker"] = TICKER          # traceability; contract ignores extras
         os.makedirs(os.path.dirname(os.path.abspath(news_output_path)) or ".", exist_ok=True)
         with open(news_output_path, "w", encoding="utf-8") as f:

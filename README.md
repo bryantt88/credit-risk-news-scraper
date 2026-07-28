@@ -92,12 +92,21 @@ python credit_risk_pipeline.py AAPL "Apple Inc." 2026-03-01 2026-06-01 --output 
 { "verdict": "DOWNGRADE WATCH",   // 5-band credit direction
   "score": -0.575,                 // signed, evidence-shrunk
   "conviction": "MEDIUM",          // LOW / MEDIUM / HIGH
-  "events": [ { "date", "direction", "sp_factor", "event", "headline", "url", "confidence" } ] }
+  "summary": "…",                  // one AI-written paragraph on the company's credit news
+  "events":     [ { "date", "direction", "sp_factor", "event", "headline", "url", "confidence" } ],
+  "developing": [ { "date", "headline", "event", "url" } ] }   // >=3 reviewed context stories
 ```
 
-Field names are fixed — a rename comes with a heads-up first. With `--output`, all inputs
-must be passed as arguments (it will not drop to interactive prompts). The full `results/`
-JSON is written as well and is unaffected.
+`verdict`, `score`, `conviction`, `events` are the `joywin_contracts.NewsSignal` contract;
+`summary` and `developing` are additive extras (the engine ignores them until the contract adds
+them). **`summary` and `developing` are always populated** — so there's a readable news takeaway
+even when nothing clears the materiality bar (`events` is empty). The `summary` is one LLM call on
+the active judge backend (`USE_NEWS_SUMMARY`, default on); it falls back to a deterministic
+one-liner if the LLM is unavailable, so a run never fails for lack of a summary.
+
+Field names are fixed — a rename comes with a heads-up first. With `--output`, all inputs must be
+passed as arguments (it will not drop to interactive prompts). The full `results/` JSON is written
+as well and is unaffected.
 
 **Validation harness** — batch-runs the labelled cases in `backtest_cases.csv` and prints a scoreboard / confusion matrix:
 
