@@ -3147,7 +3147,10 @@ def _choose_judge():
     _, JUDGE_BACKEND, JUDGE_MODEL = JUDGE_CHOICES[idx]
 
 
-USE_NEWS_SUMMARY = True   # generate a short AI news narrative (one extra LLM call/run; off = fallback)
+# Generate a short AI news narrative (one extra LLM call/run; off = deterministic fallback).
+# Env-overridable so batch callers (e.g. the backtest harness, which only needs the score) can
+# disable the per-case summary call: USE_NEWS_SUMMARY=0.
+USE_NEWS_SUMMARY = os.environ.get("USE_NEWS_SUMMARY", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _claude_text(prompt: str) -> str:

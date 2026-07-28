@@ -90,6 +90,7 @@ def run_case(case, judge_choice, attempts=2, account=None):
     cmd = [sys.executable, str(PIPELINE), case["ticker"], case["company"],
            case["start"], case["end"], str(judge_choice)]
     env = os.environ.copy()
+    env["USE_NEWS_SUMMARY"] = "0"   # backtests score only — skip the per-case AI summary LLM call
     label = ""
     if account:
         if account.get("userprofile"):
