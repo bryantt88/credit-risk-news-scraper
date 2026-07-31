@@ -3312,21 +3312,24 @@ def run_pipeline():
     print(f"  Period : {START_DATE}  ->  {END_DATE}")
     print(f"  Judge  : {JUDGE_MODEL}  ({JUDGE_BACKEND})\n")
 
+    # A missing key / unusable backend is "cannot run", not "ran and found nothing":
+    # exit non-zero and write no --output, so the engine keys the node as failed
+    # rather than treating a broken run as a real (empty) result.
     if FINNHUB_API_KEY == "YOUR_FINNHUB_API_KEY_HERE":
         print("ERROR: Set the FINNHUB_API_KEY environment variable before running.")
-        return
+        sys.exit(1)
 
     if JUDGE_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
         print("ERROR: Set OPENROUTER_API_KEY (in .env or the environment) to use an "
               "OpenRouter model.")
-        return
+        sys.exit(1)
 
     if JUDGE_BACKEND == "gemini":
         try:
             _find_gemini_exe()
         except RuntimeError as exc:
             print(f"ERROR: {exc}")
-            return
+            sys.exit(1)
         if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
             print("  WARNING: GOOGLE_CLOUD_PROJECT is not set. A Workspace Google account needs it "
                   "for the free Gemini CLI tier; a personal @gmail account can ignore this.\n")
